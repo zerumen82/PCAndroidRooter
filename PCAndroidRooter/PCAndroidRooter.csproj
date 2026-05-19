@@ -1,3 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
@@ -9,12 +10,15 @@
     <AssemblyName>PCAndroidRooter</AssemblyName>
     <RootNamespace>PCAndroidRooter</RootNamespace>
     <Description>Herramienta para rootear dispositivos Android desde PC</Description>
+    <StartupObject>PCAndroidRooter.App</StartupObject>
+    <ApplicationIcon>Resources\android_capsule_icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="MaterialDesignThemes" Version="5.*" />
     <PackageReference Include="MaterialDesignColors" Version="5.*" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.*" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
   </ItemGroup>
 
 </Project>
