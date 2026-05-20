@@ -619,32 +619,51 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         var apps = new List<string>();
         var apkDir = Path.Combine(backupDir, "apps");
         Directory.CreateDirectory(apkDir);
+        var packages = new List<string>();
 
         try
         {
             var packagesResult = _adbService.ExecuteAdb($"-s {serial} shell pm list packages -3");
-            if (!packagesResult.Success) return apps;
+            if (!packagesResult.Success)
+            {
+                Log("    ERROR: No se pudo listar paquetes del dispositivo.");
+                return apps;
+            }
 
-            var packages = packagesResult.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            packages = packagesResult.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 .Select(l => l.Trim().Replace("package:", ""))
                 .Where(p => !string.IsNullOrEmpty(p)).ToList();
 
-            foreach (var package in packages)
+            Log($"    Encontradas {packages.Count} apps instaladas. Procesando hasta 50...");
+            var count = 0;
+
+            foreach (var package in packages.Take(50))
             {
                 ct.ThrowIfCancellationRequested();
+                count++;
+                
                 var pathResult = _adbService.ExecuteAdb($"-s {serial} shell pm path {package}");
                 if (!pathResult.Success) continue;
 
                 var apkPath = pathResult.Output.Replace("package:", "").Trim();
-                if (string.IsNullOrEmpty(apkPath)) continue;
+                if (string.IsNullOrEmpty(apkPath) || !apkPath.EndsWith(".apk")) continue;
 
                 var fileName = $"{package}.apk";
                 var targetPath = Path.Combine(apkDir, fileName);
                 var pullResult = _adbService.PullFile(serial, apkPath, targetPath);
                 if (pullResult.Success)
                 {
-                    apps.Add(package);
-                    Log($"    Guardada app: {package}");
+                    var fileInfo = new FileInfo(targetPath);
+                    if (fileInfo.Length > 1000) // Validar archivo no vacío
+                    {
+                        apps.Add(package);
+                        Log($"    [{count}/{packages.Count}] Guardada: {package}");
+                    }
+                    else
+                    {
+                        File.Delete(targetPath); // Eliminar archivo inválido
+                        Log($"    [{count}/{packages.Count}] Archivo vacío, omitido: {package}");
+                    }
                 }
             }
         }
@@ -653,6 +672,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             Log($"    Error al respaldar apps: {ex.Message}");
         }
 
+        Log($"    Apps respaldadas: {apps.Count}/{packages.Count}");
         return apps;
     }
 
