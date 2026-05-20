@@ -635,16 +635,32 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             ct.ThrowIfCancellationRequested();
             try
             {
-                var listResult = _adbService.ExecuteAdb($"-s {serial} shell \"ls -l {basePath} 2>/dev/null | head -20\"");
+                Log($"    Explorando {basePath}...");
+                
+                var listResult = _adbService.ExecuteAdb($"-s {serial} shell \"find {basePath} -type f -name '*.jpg' -o -name '*.png' -o -name '*.mp4' -o -name '*.pdf' 2>/dev/null | head -50\"");
                 if (!listResult.Success) continue;
 
-                Log($"    Explorando {basePath}...");
+                foreach (var line in listResult.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var remotePath = line.Trim();
+                    if (string.IsNullOrEmpty(remotePath) || remotePath.Contains("No such file")) continue;
+
+                    var fileName = Path.GetFileName(remotePath);
+                    if (string.IsNullOrEmpty(fileName)) continue;
+
+                    var targetPath = Path.Combine(mediaDir, fileName);
+                    var pullResult = _adbService.PullFile(serial, remotePath, targetPath);
+                    if (pullResult.Success)
+                    {
+                        files.Add(fileName);
+                    }
+                }
             }
             catch { }
         }
 
-        Log("    NOTA: El backup completo de medios se realiza mejor manualmente o vía cloud.");
-        Log("    Se recomienda usar Google Photos, Samsung Cloud o copia USB.");
+        Log($"    Archivos multimedia respaldados: {files.Count}");
         return files;
     }
 
@@ -654,8 +670,42 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         var docsDir = Path.Combine(backupDir, "documents");
         Directory.CreateDirectory(docsDir);
 
-        Log("    NOTA: Documentos pueden requerir permisos especiales en Android 11+");
-        Log("    Se recomienda usar 'Compartir' desde cada app para respaldar manualmente.");
+        var docPaths = new[]
+        {
+            "/sdcard/Documents", "/sdcard/Download", "/sdcard/WhatsApp"
+        };
+
+        foreach (var basePath in docPaths)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                Log($"    Buscando documentos en {basePath}...");
+                
+                var listResult = _adbService.ExecuteAdb($"-s {serial} shell \"find {basePath} -type f \\( -name '*.pdf' -o -name '*.doc' -o -name '*.docx' -o -name '*.xls' -o -name '*.xlsx' -o -name '*.txt' \\) 2>/dev/null | head -30\"");
+                if (!listResult.Success) continue;
+
+                foreach (var line in listResult.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var remotePath = line.Trim();
+                    if (string.IsNullOrEmpty(remotePath) || remotePath.Contains("No such file")) continue;
+
+                    var fileName = Path.GetFileName(remotePath);
+                    if (string.IsNullOrEmpty(fileName)) continue;
+
+                    var targetPath = Path.Combine(docsDir, fileName);
+                    var pullResult = _adbService.PullFile(serial, remotePath, targetPath);
+                    if (pullResult.Success)
+                    {
+                        files.Add(fileName);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        Log($"    Documentos respaldados: {files.Count}");
         return files;
     }
 
