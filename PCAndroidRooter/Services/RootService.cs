@@ -834,6 +834,88 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         }
     }
 
+    public RootMethodStatus RestoreBackupAsync(string serial, string backupDir, CancellationToken ct)
+    {
+        Log("═══════════════════════════════════════════");
+        Log("     RESTAURACIÓN DE BACKUP");
+        Log("═══════════════════════════════════════════");
+
+        if (!Directory.Exists(backupDir))
+        {
+            Log($"ERROR: El backup no existe en: {backupDir}");
+            return RootMethodStatus.Failed;
+        }
+
+        // Check for ZIP file
+        var zipFile = Directory.GetFiles(Path.GetDirectoryName(backupDir) ?? backupDir, "*.zip")
+            .FirstOrDefault(f => f.StartsWith(backupDir));
+        
+        if (zipFile != null && File.Exists(zipFile))
+        {
+            Log($"Encontrado archivo comprimido: {zipFile}");
+            Log("Descomprimiendo...");
+            var extractDir = Path.Combine(Path.GetDirectoryName(zipFile) ?? "", Path.GetFileNameWithoutExtension(zipFile));
+            ZipFile.ExtractToDirectory(zipFile, extractDir, overwriteFiles: true);
+            backupDir = extractDir;
+        }
+
+        Log($"\nRestaurando desde: {backupDir}");
+
+        // Restore apps
+        var appsDir = Path.Combine(backupDir, "apps");
+        if (Directory.Exists(appsDir))
+        {
+            Log("\n[1/3] Restaurando apps...");
+            foreach (var apk in Directory.GetFiles(appsDir, "*.apk"))
+            {
+                ct.ThrowIfCancellationRequested();
+                Log($"  Instalando: {Path.GetFileNameWithoutExtension(apk)}");
+                var result = _adbService.InstallApk(serial, apk);
+                if (result.Success)
+                    Log("    ✅ Instalada");
+                else
+                    Log($"    ❌ Error: {result.Error}");
+            }
+        }
+
+        // Restore documents/media
+        var mediaDir = Path.Combine(backupDir, "media");
+        var docsDir = Path.Combine(backupDir, "documents");
+        
+        if (Directory.Exists(mediaDir) || Directory.Exists(docsDir))
+        {
+            Log("\n[2/3] Restaurando archivos...");
+            var deviceStorage = "/sdcard/Download/PCAndroidRooter_Restored";
+            _adbService.Shell(serial, $"mkdir -p {deviceStorage}");
+            
+            var allFiles = Enumerable.Empty<string>();
+            if (Directory.Exists(mediaDir)) allFiles = allFiles.Concat(Directory.GetFiles(mediaDir));
+            if (Directory.Exists(docsDir)) allFiles = allFiles.Concat(Directory.GetFiles(docsDir));
+            
+            foreach (var file in allFiles)
+            {
+                ct.ThrowIfCancellationRequested();
+                _adbService.PushFile(serial, file, $"{deviceStorage}/{Path.GetFileName(file)}");
+            }
+            Log($"  Archivos guardados en: {deviceStorage}");
+        }
+
+        // Restore contacts (requires special handling)
+        var contactsFile = Path.Combine(backupDir, "contacts.txt");
+        if (File.Exists(contactsFile))
+        {
+            Log("\n[3/3] Contactos detectados en backup.");
+            Log("  NOTA: La restauración de contactos requiere importar manualmente");
+            Log("  desde la app de Contactos > Importar/Exportar > Archivo VCard");
+        }
+
+        Log("\n✅ Restauración completada");
+        Log("  Las apps instaladas aparecerán en la pantalla de inicio");
+        Log("  Los archivos están en /sdcard/Download/PCAndroidRooter_Restored");
+        
+        return RootMethodStatus.Success;
+    }
+
     private async Task<RootMethodStatus> CustomRecoveryRootAsync(string serial, CancellationToken ct)
     {
         Log("═══════════════════════════════════════════");
