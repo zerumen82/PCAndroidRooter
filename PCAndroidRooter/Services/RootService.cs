@@ -580,6 +580,21 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             await File.WriteAllTextAsync(summaryPath, 
                 System.Text.Json.JsonSerializer.Serialize(summary, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), ct);
             Log($"  Resumen del backup guardado en: {summaryPath}");
+            
+            // Create ZIP archive for easier restoration
+            try
+            {
+                var zipPath = backupDir + ".zip";
+                if (File.Exists(zipPath)) File.Delete(zipPath);
+                Log("  Creando archivo comprimido del backup...");
+                ZipFile.CreateFromDirectory(backupDir, zipPath, CompressionLevel.Optimal, false);
+                Log($"  Backup comprimido guardado en: {zipPath}");
+                Log($"  Tamaño: {new FileInfo(zipPath).Length / 1024 / 1024} MB");
+            }
+            catch (Exception ex)
+            {
+                Log($"  Error al crear ZIP: {ex.Message}");
+            }
         }
         catch (Exception ex)
         {
