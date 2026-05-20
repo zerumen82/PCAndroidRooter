@@ -127,6 +127,8 @@ case RootMethodType.CustomRecovery:
 
         Log("\nPASO 4: Extrayendo boot.img del dispositivo...");
         var bootImgLocal = Path.Combine(_magiskService.MagiskDir, "boot.img");
+        var bootImgBackup = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"boot_original_{DateTime.Now:yyyyMMdd_HHmmss}.img");
+        
         var extracted = await _adbService.ExtractBootImgAsync(serial, bootPart, bootImgLocal, ct);
         if (!extracted)
         {
@@ -137,6 +139,15 @@ case RootMethodType.CustomRecovery:
                 "  3. Tener bootloader desbloqueado");
             return RootMethodStatus.Failed;
         }
+        
+        // Guardar copia de seguridad del boot.img original
+        try
+        {
+            File.Copy(bootImgLocal, bootImgBackup, overwrite:true);
+            Log($"  Boot.img original guardado en: {bootImgBackup}");
+        }
+        catch { }
+        
         ct.ThrowIfCancellationRequested();
 
         Log("\nPASO 5: Preparando binaries de Magisk en el dispositivo...");
