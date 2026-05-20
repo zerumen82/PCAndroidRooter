@@ -1,12 +1,14 @@
-using System.ComponentModel;
-using System.Diagnostics;
-using System.IO;
-using System.IO.Compression;
-using System.Net.Http;
-using System.Text;
-using System.Text.RegularExpressions;
-using System.Windows;
-using PCAndroidRooter.Models;
+ using System;
+ using System.Collections.Generic;
+ using System.ComponentModel;
+ using System.Diagnostics;
+ using System.IO;
+ using System.IO.Compression;
+ using System.Net.Http;
+ using System.Text;
+ using System.Text.RegularExpressions;
+ using System.Windows;
+ using PCAndroidRooter.Models;
 
 namespace PCAndroidRooter.Services;
 
@@ -115,20 +117,20 @@ public class AdbService
         return ExecuteBinary(_adbPath, arguments, dispatchOutput, ct);
     }
 
-    public AdbCommandResult ExecuteFastboot(string arguments, bool dispatchOutput = true, CancellationToken ct = default)
-    {
-        return ExecuteBinary(_fastbootPath, arguments, dispatchOutput, ct);
-    }
+     public AdbCommandResult ExecuteFastboot(string arguments, bool dispatchOutput = true, CancellationToken ct = default)
+     {
+         return ExecuteBinary(_fastbootPath, arguments, dispatchOutput, ct, Encoding.UTF8);
+     }
 
-    private AdbCommandResult ExecuteBinary(string binaryPath, string arguments, bool dispatchOutput = true, CancellationToken ct = default)
-    {
-        var result = new AdbCommandResult();
+     private AdbCommandResult ExecuteBinary(string binaryPath, string arguments, bool dispatchOutput = true, CancellationToken ct = default, Encoding? outputEncoding = null)
+     {
+         var result = new AdbCommandResult();
 
-        var binaryName = Path.GetFileNameWithoutExtension(binaryPath);
-        CommandExecuting?.Invoke($"> {binaryName} {arguments}");
+         var binaryName = Path.GetFileNameWithoutExtension(binaryPath);
+         CommandExecuting?.Invoke($"> {binaryName} {arguments}");
 
-        try
-        {
+         try
+         {
             if (ct.IsCancellationRequested)
             {
                 result.Success = false;
@@ -136,17 +138,17 @@ public class AdbService
                 return result;
             }
 
-            var psi = new ProcessStartInfo
-            {
-                FileName = binaryPath,
-                Arguments = arguments,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8
-            };
+             var psi = new ProcessStartInfo
+             {
+                 FileName = binaryPath,
+                 Arguments = arguments,
+                 UseShellExecute = false,
+                 CreateNoWindow = true,
+                 RedirectStandardOutput = true,
+                 RedirectStandardError = true,
+                 StandardOutputEncoding = outputEncoding ?? Encoding.UTF8,
+                 StandardErrorEncoding = outputEncoding ?? Encoding.UTF8
+             };
 
             using var process = Process.Start(psi);
             if (process == null)
@@ -177,25 +179,29 @@ public class AdbService
                 if (e.Data == null) errorWaitHandle.Set();
                 else
                 {
+                    var clean = StripAnsi(e.Data);
                     error.AppendLine(e.Data);
                     if (dispatchOutput)
-                        Application.Current?.Dispatcher.InvokeAsync(() => ErrorReceived?.Invoke(e.Data));
+                    {
+                        if (clean.StartsWith("* daemon not running; starting now at tcp:", StringComparison.Ordinal) ||
+                            clean.StartsWith("* daemon started successfully", StringComparison.Ordinal) ||
+                            clean.StartsWith("daemon started successfully", StringComparison.Ordinal))
+                            Application.Current?.Dispatcher.InvokeAsync(() => OutputReceived?.Invoke(e.Data));
+                        else
+                            Application.Current?.Dispatcher.InvokeAsync(() => ErrorReceived?.Invoke(e.Data));
+                    }
                 }
             };
 
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
-            while (!process.HasExited)
+            if (!process.WaitForExit(15000))
             {
-                if (ct.WaitHandle.WaitOne(500) || ct.IsCancellationRequested)
-                {
-                    try { process.Kill(entireProcessTree: true); } catch { }
-                    result.Success = false;
-                    result.Error = "Operación cancelada por el usuario";
-                    result.ExitCode = -1;
-                    return result;
-                }
+                try { process.Kill(entireProcessTree: true); } catch { }
+                result.Success = false;
+                result.Error = "El comando excedió el tiempo límite (15s)";
+                return result;
             }
 
             outputWaitHandle.WaitOne(5000);
@@ -215,13 +221,25 @@ public class AdbService
         return result;
     }
 
-    public List<string> GetConnectedDevices()
+    // Elimina códigos de escape ANSI (colores, negrita, etc.) de la salida de procesos
+    private static string StripAnsi(string input)
     {
-        var result = ExecuteAdb("devices -l", dispatchOutput: false);
-        if (!result.Success) return new List<string>();
+        return Regex.Replace(input, @"\x1B\[[0-9;]*[mK]", string.Empty);
+    }
 
-        var devices = new List<string>();
-        var lines = result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    public List<string> GetConnectedDevices()
+     {
+         var result = ExecuteAdb("devices -l", dispatchOutput: false);
+         if (!result.Success)
+         {
+             Debug.WriteLine($"[ADB] devices -l falló: {result.Error}");
+             return new List<string>();
+         }
+
+         Debug.WriteLine($"[ADB] devices -l output: \"{result.Output}\"");
+
+         var devices = new List<string>();
+         var lines = result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
         foreach (var line in lines.Skip(1))
         {
@@ -632,5 +650,10 @@ public class AdbService
         if (!result.Success)
             result = ExecuteFastboot($"-s {serial} getvar unlocked 2>/dev/null");
         return result;
+    }
+
+    public AdbCommandResult InstallApk(string serial, string apkPath)
+    {
+        return ExecuteAdb($"-s {serial} install -r \"{apkPath}\"");
     }
 }
