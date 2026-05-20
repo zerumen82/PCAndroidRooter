@@ -564,6 +564,28 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         Log("  Esto es normal — configúralo de nuevo como dispositivo nuevo.");
         Log($"  El backup está disponible en: {backupDir}");
 
+        // Create backup summary file
+        try
+        {
+            var summary = new
+            {
+                backupDir = backupDir,
+                serial = serial,
+                timestamp = DateTime.Now,
+                appsCount = apkResult.Count,
+                mediaCount = mediaResult.Count,
+                documentsCount = docsResult.Count
+            };
+            var summaryPath = Path.Combine(backupDir, "backup_summary.json");
+            await File.WriteAllTextAsync(summaryPath, 
+                System.Text.Json.JsonSerializer.Serialize(summary, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), ct);
+            Log($"  Resumen del backup guardado en: {summaryPath}");
+        }
+        catch (Exception ex)
+        {
+            Log($"  Error al crear resumen: {ex.Message}");
+        }
+
         Log("\nReiniciando dispositivo...");
         _adbService.FastbootReboot(serial);
         Log("  El dispositivo se reiniciará. Puede tardar varios minutos en el primer arranque.");
@@ -722,11 +744,47 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
                 Log($"    Contactos guardados en {contactsFile}");
             }
 
-            Log("    NOTA: SMS requieren root o app especializada para exportar.");
+            Log("    Intentando backup de SMS...");
+            
+            // Try to backup SMS database (requires appropriate permissions)
+            var smsPaths = new[]
+            {
+                "/data/data/com.android.providers.telephony/databases/mmssms.db",
+                "/sdcard/Android/data/com.android.providers.telephony/databases/mmssms.db"
+            };
+
+            foreach (var smsPath in smsPaths)
+            {
+                ct.ThrowIfCancellationRequested();
+                var checkResult = _adbService.ExecuteAdb($"-s {serial} shell \"ls {smsPath} 2>/dev/null\"");
+                if (!checkResult.Success) continue;
+
+                var smsFile = Path.Combine(backupDir, "sms_backup.db");
+                var pullResult = _adbService.PullFile(serial, smsPath, smsFile);
+                if (pullResult.Success)
+                {
+                    Log($"    SMS guardados en {smsFile}");
+                    break;
+                }
+            }
+
+            // Try WhatsApp database as alternative
+            var waResult = _adbService.ExecuteAdb($"-s {serial} shell \"ls /sdcard/WhatsApp/Databases/msgstore.db 2>/dev/null\"");
+            if (waResult.Success)
+            {
+                var waFile = Path.Combine(backupDir, "whatsapp_backup.db");
+                var waPull = _adbService.PullFile(serial, "/sdcard/WhatsApp/Databases/msgstore.db", waFile);
+                if (waPull.Success)
+                {
+                    Log($"    WhatsApp mensajes guardados en {waFile}");
+                }
+            }
+
+            Log("    NOTA: Para backup completo de SMS, usa una app como 'SMS Backup & Restore'.");
         }
         catch (Exception ex)
         {
-            Log($"    Error al respaldar contactos: {ex.Message}");
+            Log($"    Error al respaldar contactos/mensajes: {ex.Message}");
         }
     }
 
