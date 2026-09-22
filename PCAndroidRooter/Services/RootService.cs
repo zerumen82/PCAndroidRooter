@@ -114,6 +114,36 @@ case RootMethodType.CustomRecovery:
         catch { }
     }
 
+    private const string RemoteMagiskDir = "/data/local/tmp/magisk";
+    private static readonly string[] MagiskBinaryFiles =
+        { "magiskboot", "magiskboot32", "magisk64", "magisk32", "magiskinit" };
+
+    private int PushMagiskBinaries(string serial, CancellationToken ct)
+    {
+        _adbService.Shell(serial, $"mkdir -p {RemoteMagiskDir}", ct: ct);
+        _adbService.Shell(serial, $"rm -rf {RemoteMagiskDir}/*", ct: ct);
+
+        var pushed = 0;
+        foreach (var file in MagiskBinaryFiles)
+        {
+            ct.ThrowIfCancellationRequested();
+            var localPath = Path.Combine(_magiskService.MagiskDir, file);
+            if (!File.Exists(localPath)) continue;
+            var result = _adbService.PushFile(serial, localPath, $"{RemoteMagiskDir}/{file}");
+            if (result.Success)
+            {
+                pushed++;
+                _adbService.Shell(serial, $"chmod 755 {RemoteMagiskDir}/{file}", ct: ct);
+            }
+        }
+        return pushed;
+    }
+
+    private string RemoteMagiskBootPath =>
+        File.Exists(Path.Combine(_magiskService.MagiskDir, "magiskboot"))
+            ? $"{RemoteMagiskDir}/magiskboot"
+            : $"{RemoteMagiskDir}/magiskboot32";
+
     private async Task<RootMethodStatus> MagiskRootAsync(string serial, CancellationToken ct)
     {
         Log("╔═══════════════════════════════════════════╗");
@@ -289,25 +319,8 @@ case RootMethodType.CustomRecovery:
         // PASO 5: Subir binaries Magisk al dispositivo
         // ════════════════════════════════════════════════════
         Log("\nPASO 5: Preparando binaries de Magisk en el dispositivo...");
-        var remoteDir = "/data/local/tmp/magisk";
-        _adbService.Shell(serial, $"rm -rf {remoteDir}");
-        _adbService.Shell(serial, $"mkdir -p {remoteDir}");
-
-        var magiskFiles = new[] { "magiskboot", "magiskboot32", "magisk64", "magisk32", "magiskinit" };
-        int pushed = 0;
-        foreach (var file in magiskFiles)
-        {
-            var localPath = Path.Combine(_magiskService.MagiskDir, file);
-            if (File.Exists(localPath))
-            {
-                var result = _adbService.PushFile(serial, localPath, $"{remoteDir}/{file}");
-                if (result.Success)
-                {
-                    pushed++;
-                    _adbService.Shell(serial, $"chmod 755 {remoteDir}/{file}");
-                }
-            }
-        }
+        var remoteDir = RemoteMagiskDir;
+        var pushed = PushMagiskBinaries(serial, ct);
 
         if (pushed == 0)
         {
@@ -354,8 +367,7 @@ case RootMethodType.CustomRecovery:
         // PASO 7: Parchear boot.img con Magisk
         // ════════════════════════════════════════════════════
         Log("\nPASO 7: Parcheando boot.img con Magisk...");
-        var magiskBootBin = File.Exists(Path.Combine(_magiskService.MagiskDir, "magiskboot"))
-            ? $"{remoteDir}/magiskboot" : $"{remoteDir}/magiskboot32";
+        var magiskBootBin = RemoteMagiskBootPath;
 
         // Desempaquetar boot.img
         Log("  [7.1] Desempaquetando boot.img...");
@@ -880,7 +892,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
                 LogWarning("Si el toggle 'Desbloqueo OEM' no aparece en Opciones de desarrollador:");
                 if (isMediatek)
                 {
-                    LogOk("Tu Galaxy A15 usa chip MediaTek → compatible con MTKClient.");
+                    LogOk("Tu dispositivo usa chip MediaTek → compatible con MTKClient.");
                     LogOk("Usa el método 'MTKClient Unlock' de esta herramienta como alternativa.\n");
                 }
                 else
@@ -965,7 +977,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
                 Log("  Si no ves la opción en Ajustes > Opciones de desarrollador:");
                 if (isMediatek2)
                 {
-                    LogOk("Tu Galaxy A15 usa chip MediaTek → compatible con MTKClient.");
+                    LogOk("Tu dispositivo usa chip MediaTek → compatible con MTKClient.");
                     LogOk("Usa el método 'MTKClient Unlock' en lugar de este.");
                     Log("  Cierra este método y selecciona 'MTKClient Unlock' en la lista.");
                 }
@@ -2144,19 +2156,11 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         ct.ThrowIfCancellationRequested();
 
         Log("\nPASO 4: Preparando binaries de Magisk en el dispositivo...");
-        var remoteDir = "/data/local/tmp/magisk";
-        _adbService.Shell(serial, $"mkdir -p {remoteDir}");
-        _adbService.Shell(serial, $"rm -rf {remoteDir}/*");
-
-        var magiskFiles = new[] { "magiskboot", "magiskboot32", "magisk64", "magisk32", "magiskinit" };
-        foreach (var file in magiskFiles)
+        var remoteDir = RemoteMagiskDir;
+        var pushed = PushMagiskBinaries(serial, ct);
+        if (pushed == 0)
         {
-            var localPath = Path.Combine(_magiskService.MagiskDir, file);
-            if (File.Exists(localPath))
-            {
-                _adbService.PushFile(serial, localPath, $"{remoteDir}/{file}");
-                _adbService.Shell(serial, $"chmod 755 {remoteDir}/{file}");
-            }
+            LogWarning("No se pudieron subir todos los binaries de Magisk.");
         }
 
         ct.ThrowIfCancellationRequested();
@@ -2366,8 +2370,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         Log("");
 
         var deviceInfo = await _adbService.GetDeviceInfoAsync(serial);
-        var chipset = deviceInfo?.Model?.Contains("A15") == true ? "Helio G99" : "MediaTek";
-        Log($"Dispositivo: {deviceInfo?.Manufacturer} {deviceInfo?.Model} ({chipset})");
+        Log($"Dispositivo: {deviceInfo?.Manufacturer} {deviceInfo?.Model} (MediaTek)");
         Log($"Android: {deviceInfo?.AndroidVersion}");
         Log("");
 
@@ -2443,7 +2446,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             LogWarning("- Prueba con VOL- en lugar de VOL+");
             LogWarning("- Prueba con ambos volumenes");
             LogWarning("- Cambia de cable USB o puerto");
-            LogWarning("- Abre el teléfono y puentea test point (YouTube: 'A15 test point')");
+            LogWarning("- Abre el teléfono y puentea test point (busca 'test point BROM' + tu modelo en YouTube)");
             Log("Igualmente se intentará ejecutar MTKClient por si acaso...");
         }
 
@@ -2516,7 +2519,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
                 Log("- Probar ambos volumenes al conectar USB");
                 Log("- Cambiar de cable USB o puerto");
                 Log("- Si persiste: abrir el teléfono y puentear test point");
-                Log("  (busca en YouTube: 'A15 test point BROM')");
+                Log("  (busca en YouTube: 'test point BROM' + tu modelo)");
                 Log("");
                 Log("Comando manual para depurar:");
                 Log($"  cd \"{mtkDir}\" && .\\venv\\Scripts\\python -m mtkclient da seccfg unlock");

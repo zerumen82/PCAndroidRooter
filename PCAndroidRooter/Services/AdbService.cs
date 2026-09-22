@@ -22,8 +22,10 @@ namespace PCAndroidRooter.Services;
 
     // Allowlist regex for serial numbers — only alphanumeric, dots, hyphens, colons, underscores
     private static readonly Regex ValidSerialRegex = new(@"^[a-zA-Z0-9\.\-_:]+$", RegexOptions.Compiled);
-    // Allowlist regex for block device paths
-    private static readonly Regex ValidBlockPathRegex = new(@"^/dev/block/(?:by-name|bootdevice|platform)/[\w\-\.]+$|^/dev/block/[\w\-\.]+$|^/dev/bootimg$", RegexOptions.Compiled);
+    // Allowlist regex for block device paths (nested by-name/bootdevice/platform allowed)
+    private static readonly Regex ValidBlockPathRegex = new(
+        @"^/dev/block/(?:by-name|bootdevice|platform)(?:/[\w\-\.]+)+$|^/dev/block/[\w\-\.]+$|^/dev/bootimg$",
+        RegexOptions.Compiled);
     // Allowlist regex for package names
     private static readonly Regex ValidPackageNameRegex = new(@"^[a-zA-Z0-9._\-]+$", RegexOptions.Compiled);
 
@@ -35,9 +37,13 @@ namespace PCAndroidRooter.Services;
 
     /// <summary>
     /// Valida que un path de partición sea seguro para usar en comandos shell.
+    /// Rechaza path traversal (..) y caracteres no permitidos.
     /// </summary>
     public static bool IsValidBlockPath(string path) =>
-        !string.IsNullOrWhiteSpace(path) && (ValidBlockPathRegex.IsMatch(path) || path.StartsWith("/data/local/tmp/"));
+        !string.IsNullOrWhiteSpace(path) &&
+        !path.Contains("..", StringComparison.Ordinal) &&
+        !path.Contains('\0') &&
+        (ValidBlockPathRegex.IsMatch(path) || path.StartsWith("/data/local/tmp/", StringComparison.Ordinal));
 
     /// <summary>
     /// Valida que un nombre de paquete Android sea seguro para usar en comandos shell.

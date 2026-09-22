@@ -192,8 +192,16 @@ public static class BootImageValidator
         }
 
         // Comparar con original si se proporciona
-        if (!string.IsNullOrEmpty(originalPath) && File.Exists(originalPath))
+        if (!string.IsNullOrEmpty(originalPath))
         {
+            if (!File.Exists(originalPath))
+            {
+                result.Status = ValidationStatus.UnknownError;
+                result.Message = "El boot.img original de referencia no existe. " +
+                               "No se puede validar el parche sin el original.";
+                return result;
+            }
+
             var originalSize = new FileInfo(originalPath).Length;
             var ratio = (double)fileInfo.Length / originalSize;
 
