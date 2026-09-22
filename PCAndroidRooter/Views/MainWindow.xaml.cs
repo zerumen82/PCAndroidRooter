@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media.Animation;
 using PCAndroidRooter.Services;
 using PCAndroidRooter.ViewModels;
 
@@ -9,6 +10,7 @@ namespace PCAndroidRooter.Views;
 public partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel;
+    private Storyboard? spinStoryboard;
 
     public MainWindow()
     {
@@ -35,6 +37,24 @@ public partial class MainWindow : Window
             {
                 if (LogScrollViewer != null && LogScrollViewer.ViewportHeight < LogScrollViewer.ExtentHeight)
                     LogScrollViewer.ScrollToBottom();
+            });
+        }
+
+        if (e.PropertyName == nameof(MainViewModel.IsRooting))
+        {
+            Dispatcher.InvokeAsync(() =>
+            {
+                var spinAnimation = (Storyboard)FindResource("SpinAnimation");
+                if (_viewModel.IsRooting)
+                {
+                    spinStoryboard = spinAnimation;
+                    spinStoryboard?.Begin(this, true);
+                }
+                else
+                {
+                    spinStoryboard?.Stop(this);
+                    SpinTransform.Angle = 0;
+                }
             });
         }
     }

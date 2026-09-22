@@ -18,6 +18,7 @@ public class DeviceInfo
     public string SecurityPatch { get; set; } = "Desconocido";
     public string ConnectionStatus { get; set; } = "Desconectado";
     public string CpuInfo { get; set; } = "Desconocido";
+    public bool IsMediaTek { get; set; }
     public long TotalRam { get; set; }
     public long TotalStorage { get; set; }
 }

@@ -8,7 +8,12 @@ public enum RootMethodType
     MagiskPatch,
     BootloaderUnlock,
     AdbExploit,
-    CustomRecovery
+    CustomRecovery,
+    KernelSU,
+    OneClickRoot,
+    TemporaryRoot,
+    FastbootBoot,
+    MtkClientUnlock
 }
 
 public enum RootMethodStatus
@@ -25,8 +30,13 @@ public partial class RootMethod : ObservableObject
 {
     public string Name { get; set; } = string.Empty;
     public string Description { get; set; } = string.Empty;
+    public string FriendlyName { get; set; } = string.Empty;
+    public string FriendlyDescription { get; set; } = string.Empty;
     public RootMethodType Type { get; set; }
-    public string Icon { get; set; } = "";
+    public string Icon { get; set; } = "";
+    public bool IsAdvanced { get; set; }
+    public string Difficulty { get; set; } = "Fácil";
+    public string RiskLevel { get; set; } = "Bajo";
 
     private RootMethodStatus _status = RootMethodStatus.Ready;
     public RootMethodStatus Status
@@ -62,4 +72,11 @@ public partial class RootMethod : ObservableObject
     };
 
     public bool IsAvailable => Status != RootMethodStatus.NotSupported;
+
+    private bool _isRecommended;
+    public bool IsRecommended
+    {
+        get => _isRecommended;
+        set => SetProperty(ref _isRecommended, value);
+    }
 }

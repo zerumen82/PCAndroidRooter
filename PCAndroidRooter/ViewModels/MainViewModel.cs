@@ -1,8 +1,11 @@
+using System;
 using System.Collections.ObjectModel;
+using System.IO;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
-using System.Windows.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using PCAndroidRooter.Models;
@@ -20,6 +23,11 @@ public partial class MainViewModel : ObservableObject
     private readonly StringBuilder _logBuilder = new();
     private const int MaxLogLines = 500;
     private int _logLineCount;
+    private static readonly string LogDirectory = Path.Combine(
+        AppDomain.CurrentDomain.BaseDirectory, "logs");
+    private static readonly string LogFilePath = Path.Combine(
+        LogDirectory, $"root_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.log");
+    private static readonly object LogLock = new();
 
     public MagiskService MagiskService => _magiskService;
 
@@ -37,6 +45,14 @@ public partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private string _selectedSerial = string.Empty;
+
+    partial void OnSelectedSerialChanged(string value)
+    {
+        if (!string.IsNullOrEmpty(value) && IsDeviceConnected)
+        {
+            _ = LoadDeviceInfoAsync(value);
+        }
+    }
 
     [ObservableProperty]
     private double _adbProgress;
@@ -79,6 +95,9 @@ public partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private string _connectionStatus = "Desconectado";
+
+    [ObservableProperty]
+    private string _backupDirectory = string.Empty;
 
     public ObservableCollection<string> DeviceList { get; } = new();
     public ObservableCollection<RootMethod> RootMethods { get; } = new();
@@ -124,38 +143,124 @@ public partial class MainViewModel : ObservableObject
     {
         RootMethods.Add(new RootMethod
         {
+            Name = "One-Click Root",
+            Description = "Intenta automáticamente todos los métodos",
+            FriendlyName = " Root Automático (Recomendado)",
+            FriendlyDescription = "Detecta tu dispositivo y elige el mejor método solo",
+            Type = RootMethodType.OneClickRoot,
+            Icon = "\uE73A",
+            Difficulty = "Fácil",
+            RiskLevel = "Bajo"
+        });
+        RootMethods.Add(new RootMethod
+        {
             Name = "Magisk Patch",
             Description = "Parchea boot.img con Magisk (recomendado)",
+            FriendlyName = "Root con Magisk",
+            FriendlyDescription = "El método más seguro y confiable. Parchea el archivo de arranque.",
             Type = RootMethodType.MagiskPatch,
-            Icon = ""
+            Icon = "\uE730",
+            Difficulty = "Media",
+            RiskLevel = "Bajo"
+        });
+        RootMethods.Add(new RootMethod
+        {
+            Name = "KernelSU",
+            Description = "Alternativa ligera a Magisk",
+            FriendlyName = "Root con KernelSU",
+            FriendlyDescription = "Alternativa más ligera a Magisk. Misma seguridad.",
+            Type = RootMethodType.KernelSU,
+            Icon = "\uE730",
+            Difficulty = "Media",
+            RiskLevel = "Bajo"
         });
         RootMethods.Add(new RootMethod
         {
             Name = "Desbloquear Bootloader",
             Description = "Desbloquea el bootloader (borra datos)",
+            FriendlyName = "Desbloquear Bootloader",
+            FriendlyDescription = "Paso previo necesario para algunos métodos. Borra los datos del teléfono.",
             Type = RootMethodType.BootloaderUnlock,
-            Icon = ""
+            Icon = "\uE785",
+            Difficulty = "Media",
+            RiskLevel = "Alto",
+            IsAdvanced = false
         });
         RootMethods.Add(new RootMethod
         {
             Name = "ADB Exploit",
             Description = "Explota vulnerabilidades vía ADB",
+            FriendlyName = "Root por ADB (Experimental)",
+            FriendlyDescription = "Funciona solo en algunos dispositivos antiguos. No garantizado.",
             Type = RootMethodType.AdbExploit,
-            Icon = ""
+            Icon = "\uE74C",
+            Difficulty = "Avanzado",
+            RiskLevel = "Medio",
+            IsAdvanced = true
         });
         RootMethods.Add(new RootMethod
         {
             Name = "TWRP Recovery",
             Description = "Instala recovery personalizado + Magisk",
+            FriendlyName = "Root con Recovery",
+            FriendlyDescription = "Instala un recovery personalizado. Requiere conocimientos técnicos.",
             Type = RootMethodType.CustomRecovery,
-            Icon = ""
+            Icon = "\uE74C",
+            Difficulty = "Avanzado",
+            RiskLevel = "Alto",
+            IsAdvanced = true
         });
+        RootMethods.Add(new RootMethod
+        {
+            Name = "Root Temporal",
+            Description = "No disponible en esta versión",
+            FriendlyName = "Root Temporal (no disponible)",
+            FriendlyDescription = "No implementado en esta versión. Usa Desbloquear Bootloader + Magisk Patch.",
+            Type = RootMethodType.TemporaryRoot,
+            Icon = "\uE7BA",
+            Difficulty = "Fácil",
+            RiskLevel = "Bajo",
+            IsAdvanced = true,
+            Status = RootMethodStatus.NotSupported
+        });
+        RootMethods.Add(new RootMethod
+        {
+            Name = "Fastboot Boot (seguro)",
+            Description = "Arranque temporal sin flashear (requiere bootloader desbloqueado)",
+            FriendlyName = "Arranque Temporal (seguro)",
+            FriendlyDescription = "No modifica el teléfono. Si algo falla, solo reinicia.",
+            Type = RootMethodType.FastbootBoot,
+            Icon = "\uE7BA",
+            Difficulty = "Media",
+            RiskLevel = "Bajo",
+            IsAdvanced = true
+        });
+        RootMethods.Add(new RootMethod
+        {
+            Name = "MTKClient Unlock",
+            Description = "Desbloqueo vía bootrom MediaTek (sin toggle OEM)",
+            FriendlyName = "Desbloqueo MediaTek (avanzado)",
+            FriendlyDescription = "Para dispositivos MediaTek. Requiere abrir el teléfono en algunos casos.",
+            Type = RootMethodType.MtkClientUnlock,
+            Icon = "\uE74C",
+            Difficulty = "Avanzado",
+            RiskLevel = "Alto",
+            IsAdvanced = true
+        });
+
+        // Smart recommendation will be set when device is detected
     }
 
     public async Task InitializeAsync()
     {
         StatusText = "Inicializando ADB...";
-        await _adbService.InitializeAsync();
+        var ok = await _adbService.InitializeAsync();
+        if (!ok)
+        {
+            StatusText = "ERROR: No se pudo inicializar ADB. Revisa la consola.";
+            AppendLog("[ERROR FATAL] No se pudo iniciar ADB. Descarga manual: https://developer.android.com/studio/releases/platform-tools");
+            return;
+        }
         IsAdbReady = true;
         StatusText = "ADB listo. Conecta un dispositivo Android.";
         _detectionService.Start();
@@ -210,6 +315,48 @@ public partial class MainViewModel : ObservableObject
             AppendLog($"Dispositivo detectado: {info.Manufacturer} {info.Model} (Android {info.AndroidVersion})");
             AppendLog($"Root: {(info.IsRooted ? "✓ CON ROOT" : "✗ Sin root")} | Bootloader: {(info.BootloaderUnlocked ? "Desbloqueado" : "Bloqueado")}");
             StatusText = IsDeviceRooted ? "✓ Dispositivo con root detectado" : "Dispositivo listo para rootear";
+
+            // Smart recommendation
+            UpdateSmartRecommendation(info);
+        }
+    }
+
+    private void UpdateSmartRecommendation(DeviceInfo info)
+    {
+        // Clear all recommendations first
+        foreach (var method in RootMethods)
+            method.IsRecommended = false;
+
+        if (info.IsRooted)
+        {
+            StatusText = "✓ Este dispositivo ya tiene root. No necesitas hacer nada.";
+            return;
+        }
+
+        // Samsung → always manual flow
+        if (info.Manufacturer.Equals("samsung", StringComparison.OrdinalIgnoreCase))
+        {
+            SetRecommended(RootMethodType.OneClickRoot, "Tu Samsung necesita un proceso especial. One-Click Root te guiará.");
+            return;
+        }
+
+        // MediaTek → MTKClient if available
+        if (info.IsMediaTek && !info.BootloaderUnlocked)
+        {
+            SetRecommended(RootMethodType.MtkClientUnlock, "Chipset MediaTek detectado. MTKClient puede desbloquear sin toggle OEM.");
+            return;
+        }
+
+        // Default: recommend One-Click Root for everyone
+        SetRecommended(RootMethodType.OneClickRoot, "Este método detecta tu dispositivo y elige la mejor opción automáticamente.");
+    }
+
+    private void SetRecommended(RootMethodType type, string reason)
+    {
+        var method = RootMethods.FirstOrDefault(m => m.Type == type);
+        if (method != null)
+        {
+            method.IsRecommended = true;
         }
     }
 
@@ -234,7 +381,7 @@ public partial class MainViewModel : ObservableObject
         await LoadDeviceInfoAsync(serial);
     }
 
-    [RelayCommand]
+     [RelayCommand]
     private async Task ExecuteRootMethod(RootMethod method)
     {
         if (string.IsNullOrEmpty(SelectedSerial))
@@ -245,8 +392,49 @@ public partial class MainViewModel : ObservableObject
 
         if (IsRooting) return;
 
+        // Always confirm: One-Click may unlock bootloader (wipe) if locked
+        bool isOneClick = method.Type == RootMethodType.OneClickRoot;
+        if (isOneClick && !BootloaderUnlocked)
+        {
+            var wipeResult = MessageBox.Show(
+                "ADVERTENCIA: El bootloader está BLOQUEADO.\n\n" +
+                "One-Click Root intentará desbloquearlo automáticamente.\n" +
+                "ESTO BORRARÁ TODOS LOS DATOS del teléfono (fotos, apps, contactos, archivos).\n\n" +
+                "¿Deseas continuar?",
+                "Confirmar borrado de datos",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (wipeResult != MessageBoxResult.OK)
+            {
+                AppendLog("Operación cancelada por el usuario (confirmación de borrado).");
+                return;
+            }
+        }
+        else if (!isOneClick)
+        {
+            var warning = GetRootWarning(method);
+            if (!string.IsNullOrEmpty(warning))
+            {
+                var result = MessageBox.Show(
+                    $"{warning}\n\n¿Deseas continuar?",
+                    "Aviso",
+                    MessageBoxButton.OKCancel,
+                    MessageBoxImage.Warning);
+
+                if (result != MessageBoxResult.OK)
+                {
+                    AppendLog("Operación cancelada por el usuario.");
+                    return;
+                }
+            }
+        }
+
         IsRooting = true;
         _rootCts = new CancellationTokenSource();
+        _detectionService.Pause();
+        var keepPausedSamsungUnlock =
+            method.Type == RootMethodType.BootloaderUnlock &&
+            DeviceManufacturer.Equals("samsung", StringComparison.OrdinalIgnoreCase);
 
         try
         {
@@ -255,11 +443,134 @@ public partial class MainViewModel : ObservableObject
         }
         finally
         {
+            if (keepPausedSamsungUnlock)
+            {
+                _detectionService.Pause();
+                AppendLog("Detección de dispositivos pausada — sigue las instrucciones para el desbloqueo manual en Download Mode.");
+                AppendLog("Cuando termines, pulsa 'Refresh' para reconectar el dispositivo.");
+            }
+            else
+            {
+                _detectionService.Resume();
+            }
             IsRooting = false;
             _rootCts?.Dispose();
             _rootCts = null;
         }
     }
+
+    [RelayCommand]
+    private async Task OneClickRoot()
+    {
+        if (string.IsNullOrEmpty(SelectedSerial))
+        {
+            AppendLog("[ERROR] No hay dispositivo conectado.");
+            return;
+        }
+
+        if (IsRooting) return;
+
+        if (!BootloaderUnlocked)
+        {
+            var wipeResult = MessageBox.Show(
+                "ADVERTENCIA: El bootloader está BLOQUEADO.\n\n" +
+                "One-Click Root intentará desbloquearlo automáticamente.\n" +
+                "ESTO BORRARÁ TODOS LOS DATOS del teléfono (fotos, apps, contactos, archivos).\n\n" +
+                "¿Deseas continuar?",
+                "Confirmar borrado de datos",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (wipeResult != MessageBoxResult.OK)
+            {
+                AppendLog("Operación cancelada por el usuario (confirmación de borrado).");
+                return;
+            }
+        }
+
+        // Find the OneClickRoot method
+        var oneClickMethod = RootMethods.FirstOrDefault(m => m.Type == RootMethodType.OneClickRoot);
+        if (oneClickMethod == null) return;
+
+        // Execute directly without any prompt
+        IsRooting = true;
+        _rootCts = new CancellationTokenSource();
+        _detectionService.Pause();
+
+        try
+        {
+            AppendLog("═══════════════════════════════════════════");
+            AppendLog("  INICIANDO ROOT AUTOMÁTICO");
+            AppendLog("═══════════════════════════════════════════");
+            AppendLog("  No desconectes el teléfono.");
+            AppendLog("  Esto puede tardar varios minutos...");
+            AppendLog("");
+
+            var status = await _rootService.ExecuteMethodAsync(oneClickMethod, SelectedSerial, _rootCts.Token);
+
+            if (status == RootMethodStatus.Success)
+            {
+                AppendLog("");
+                AppendLog("═══════════════════════════════════════════");
+                AppendLog("  ✅ ¡ROOT COMPLETADO CON ÉXITO!");
+                AppendLog("═══════════════════════════════════════════");
+            }
+            else
+            {
+                AppendLog("");
+                AppendLog("El root automático no pudo completarse.");
+                AppendLog("Revisa la consola para más detalles.");
+            }
+        }
+        finally
+        {
+            _detectionService.Resume();
+            IsRooting = false;
+            _rootCts?.Dispose();
+            _rootCts = null;
+        }
+    }
+
+     private static string? GetRootWarning(RootMethod method)
+     {
+         return method.Type switch
+         {
+             RootMethodType.BootloaderUnlock =>
+                 "ADVERTENCIA: Desbloquear el bootloader BORRARÁ TODOS LOS DATOS del teléfono. " +
+                 "Se perderán fotos, aplicaciones, contactos y archivos. " +
+                 "Asegúrate de haber hecho un backup antes de continuar.",
+             RootMethodType.MagiskPatch =>
+                 "Vas a modificar el archivo de arranque del teléfono. " +
+                 "Si algo sale mal, el teléfono podría no encender. " +
+                 "Haremos un backup de seguridad antes de continuar.",
+             RootMethodType.AdbExploit =>
+                 "Este método es experimental. " +
+                 "Puede no funcionar en tu dispositivo. " +
+                 "Es seguro intentarlo — si falla, el teléfono queda como estaba.",
+             RootMethodType.CustomRecovery =>
+                 "Vas a instalar un recovery personalizado. " +
+                 "Si el proceso se interrumpe, el teléfono podría quedar inservible. " +
+                 "Asegúrate de tener batería suficiente.",
+             RootMethodType.KernelSU =>
+                 "Método alternativo a Magisk. Requiere bootloader desbloqueado. " +
+                 "El proceso es similar al de Magisk Patch.",
+             RootMethodType.OneClickRoot =>
+                 "Este método intentará automáticamente varios métodos de root. " +
+                 "El proceso puede tardar varios minutos. " +
+                 "No desconectes el teléfono durante el proceso.",
+            RootMethodType.TemporaryRoot =>
+                "Root temporal NO disponible en esta versión. " +
+                "Usa 'Desbloquear Bootloader' + 'Magisk Patch' en su lugar.",
+         RootMethodType.FastbootBoot =>
+                     "Arrancará el teléfono temporalmente con root. " +
+                     "NO modifica el teléfono permanentemente. " +
+                     "Si algo falla, solo reinicia el teléfono.",
+                RootMethodType.MtkClientUnlock =>
+                    "Desbloqueo del bootloader para dispositivos MediaTek. " +
+                    "BORRARÁ TODOS LOS DATOS del teléfono. " +
+                    "Knox se dispara permanentemente.",
+                _ => null
+         };
+     }
 
     [RelayCommand]
     private void CancelRoot()
@@ -273,8 +584,16 @@ public partial class MainViewModel : ObservableObject
     {
         if (!string.IsNullOrEmpty(SelectedSerial))
         {
-            _adbService.RebootDevice(SelectedSerial);
-            AppendLog("Reiniciando dispositivo...");
+            var result = MessageBox.Show(
+                "¿Reiniciar el dispositivo? Se cerrarán todas las apps en ejecución.",
+                "Confirmar reinicio",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Question);
+            if (result == MessageBoxResult.OK)
+            {
+                _adbService.RebootDevice(SelectedSerial);
+                AppendLog("Reiniciando dispositivo...");
+            }
         }
     }
 
@@ -283,9 +602,28 @@ public partial class MainViewModel : ObservableObject
     {
         if (!string.IsNullOrEmpty(SelectedSerial))
         {
-            _adbService.RebootToBootloader(SelectedSerial);
-            AppendLog("Reiniciando a bootloader...");
+            var result = MessageBox.Show(
+                "¿Reiniciar a modo bootloader/fastboot?\n\n" +
+                "El dispositivo no arrancará Android hasta que se reinicie normalmente.",
+                "Confirmar reinicio a bootloader",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (result == MessageBoxResult.OK)
+            {
+                _adbService.RebootToBootloader(SelectedSerial);
+                AppendLog("Reiniciando a bootloader...");
+            }
         }
+    }
+
+    [RelayCommand]
+    private void RestartAdb()
+    {
+        AppendLog("Reiniciando servidor ADB...");
+        _adbService.RestartAdb();
+        IsAdbReady = true;
+        AppendLog("ADB reiniciado.");
+        _ = LoadDeviceInfoAsync(SelectedSerial);
     }
 
     [RelayCommand]
@@ -301,24 +639,151 @@ public partial class MainViewModel : ObservableObject
         LogText = string.Empty;
     }
 
+    [RelayCommand]
+    private void OpenLogFolder()
+    {
+        try
+        {
+            Directory.CreateDirectory(LogDirectory);
+            System.Diagnostics.Process.Start("explorer.exe", LogDirectory);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[ERROR] No se pudo abrir la carpeta de logs: {ex.Message}");
+        }
+    }
+
+[RelayCommand]
+     private async Task RestoreBackup()
+     {
+         if (string.IsNullOrEmpty(SelectedSerial))
+         {
+             AppendLog("[ERROR] No hay dispositivo seleccionado.");
+             return;
+         }
+
+         if (string.IsNullOrEmpty(BackupDirectory) || !Directory.Exists(BackupDirectory))
+         {
+             AppendLog("[ERROR] El directorio de backup no existe o está vacío.");
+             return;
+         }
+
+         IsRooting = true;
+         _rootCts = new CancellationTokenSource();
+         _detectionService.Pause();
+
+         try
+         {
+             AppendLog($"Iniciando restauración desde: {BackupDirectory}");
+             await foreach (var status in _rootService.RestoreBackupAsync(SelectedSerial, BackupDirectory, _rootCts.Token))
+             {
+                 AppendLog(status);
+             }
+             AppendLog("Restauración completada exitosamente.");
+         }
+         catch (Exception ex)
+         {
+             AppendLog($"[ERROR] Error durante restauración: {ex.Message}");
+         }
+         finally
+         {
+             _detectionService.Resume();
+             IsRooting = false;
+             _rootCts?.Dispose();
+             _rootCts = null;
+         }
+     }
+
+     [RelayCommand]
+     private void BrowseBackupDirectory()
+     {
+         var dialog = new Microsoft.Win32.OpenFileDialog
+         {
+             Title = "Seleccionar archivo de backup ZIP o carpeta",
+             Filter = "Archivos ZIP de backup|*.zip|Todos los archivos|*.*",
+             CheckFileExists = true,
+             Multiselect = false
+         };
+
+         if (dialog.ShowDialog() == true)
+         {
+             var selectedPath = dialog.FileName;
+             if (File.Exists(selectedPath) && selectedPath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+             {
+                 // Auto-extract ZIP
+                 var backupDir = Path.Combine(Path.GetDirectoryName(selectedPath) ?? "", Path.GetFileNameWithoutExtension(selectedPath));
+                 try
+                 {
+                     if (Directory.Exists(backupDir))
+                     {
+                         AppendLog($"Directorio ya existe: {backupDir}");
+                     }
+                     else
+                     {
+                         AppendLog($"Descomprimiendo backup: {Path.GetFileName(selectedPath)}...");
+                         System.IO.Compression.ZipFile.ExtractToDirectory(selectedPath, backupDir);
+                         AppendLog($"Backup descomprimido en: {backupDir}");
+                     }
+                     BackupDirectory = backupDir;
+                 }
+                 catch (Exception ex)
+                 {
+                     AppendLog($"[ERROR] No se pudo descomprimir: {ex.Message}");
+                 }
+             }
+             else if (Directory.Exists(selectedPath))
+             {
+                 BackupDirectory = selectedPath;
+                 AppendLog($"Directorio de backup seleccionado: {selectedPath}");
+             }
+             else
+             {
+                 AppendLog("[ERROR] Seleccione un archivo ZIP válido o una carpeta de backup.");
+             }
+         }
+     }
+
+    private readonly object _logLock = new();
+
     public void AppendLog(string message)
     {
-        var line = $"[{DateTime.Now:HH:mm:ss}] {message}\n";
-        _logBuilder.Append(line);
-        _logLineCount++;
-
-        if (_logLineCount > MaxLogLines)
+        lock (_logLock)
         {
-            var full = _logBuilder.ToString();
-            var idx = full.IndexOf('\n', StringComparison.Ordinal);
-            if (idx > 0)
+            var line = $"[{DateTime.Now:HH:mm:ss}] {message}\n";
+            _logBuilder.Append(line);
+            _logLineCount++;
+
+            if (_logLineCount > MaxLogLines)
             {
-                _logBuilder.Remove(0, idx + 1);
-                _logLineCount--;
+                var full = _logBuilder.ToString();
+                var idx = full.IndexOf('\n', StringComparison.Ordinal);
+                if (idx > 0)
+                {
+                    _logBuilder.Remove(0, idx + 1);
+                    _logLineCount--;
+                }
+            }
+
+            LogText = _logBuilder.ToString();
+        }
+        AppendToFile(message);
+    }
+
+    private static void AppendToFile(string message)
+    {
+        try
+        {
+            lock (LogLock)
+            {
+                Directory.CreateDirectory(LogDirectory);
+                File.AppendAllText(LogFilePath,
+                    $"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
             }
         }
-
-        LogText = _logBuilder.ToString();
+        catch
+        {
+            // No romper la app si falla escribir log
+        }
     }
 
     public void Shutdown()
@@ -327,6 +792,7 @@ public partial class MainViewModel : ObservableObject
         _rootCts?.Dispose();
         _detectionService.Stop();
         _detectionService.Dispose();
-        _adbService.KillAdb();
+        _adbService.Dispose();
+        AppendToFile("=== APLICACIÓN CERRADA ===");
     }
 }

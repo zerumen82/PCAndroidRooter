@@ -1,15 +1,68 @@
 using System;
 using System.IO;
 using System.Windows;
+using System.Windows.Threading;
 
 namespace PCAndroidRooter;
 
 public partial class App : Application
 {
+    private static readonly string LogDirectory = Path.Combine(
+        AppDomain.CurrentDomain.BaseDirectory, "logs");
+    private static readonly string CrashLogPath = Path.Combine(
+        LogDirectory, $"crash_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.log");
+
     protected override void OnStartup(StartupEventArgs e)
     {
+        Directory.CreateDirectory(LogDirectory);
+
+        AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+        DispatcherUnhandledException += OnDispatcherUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+
         CreateIconIfMissing();
         base.OnStartup(e);
+    }
+
+    private void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        var ex = e.ExceptionObject as Exception;
+        SaveCrashLog(ex, "AppDomain.UnhandledException");
+    }
+
+    private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
+    {
+        SaveCrashLog(e.Exception, "DispatcherUnhandledException");
+        e.Handled = true;
+    }
+
+    private void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        SaveCrashLog(e.Exception, "UnobservedTaskException");
+        e.SetObserved();
+    }
+
+    private static void SaveCrashLog(Exception? ex, string source)
+    {
+        try
+        {
+            var lines = new[]
+            {
+                $"===== CRASH [{DateTime.Now:yyyy-MM-dd HH:mm:ss}] =====",
+                $"Source: {source}",
+                $"Exception: {ex?.GetType().FullName}",
+                $"Message: {ex?.Message}",
+                $"Stack Trace:",
+                ex?.StackTrace ?? "(null)",
+                ex?.InnerException != null ? $"Inner: {ex.InnerException}" : "",
+                "============================================"
+            };
+            File.AppendAllLines(CrashLogPath, lines);
+        }
+        catch
+        {
+            // No hacer nada si falla el log de crash
+        }
     }
 
     private void CreateIconIfMissing()
@@ -17,9 +70,9 @@ public partial class App : Application
         try
         {
             string iconPath = "Resources/android_capsule_icon.ico";
-            string directory = Path.GetDirectoryName(iconPath);
+            string? directory = Path.GetDirectoryName(iconPath);
 
-            if (!Directory.Exists(directory))
+            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
             {
                 Directory.CreateDirectory(directory);
             }
@@ -63,8 +116,8 @@ public partial class App : Application
             byte[] imageData = CreateAndroidCapsuleImageData();
             imageSize = (uint)imageData.Length;
 
-            // Go back and update the image size
-            fs.Position = 8;
+            // Go back and update the image size (offset 14 = after 6-byte ICONDIR + 8-byte ICONDIRENTRY fields before ImageSize)
+            fs.Position = 14;
             bw.Write(imageSize);
 
             // Write image data

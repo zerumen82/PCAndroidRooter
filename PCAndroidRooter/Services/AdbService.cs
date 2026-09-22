@@ -12,12 +12,59 @@
 
 namespace PCAndroidRooter.Services;
 
-public class AdbService
+ public class AdbService : IDisposable
 {
     private string _adbPath;
     private string _fastbootPath;
     private readonly HttpClient _httpClient;
+    private bool _disposed;
     private const string AdbUrl = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip";
+
+    // Allowlist regex for serial numbers — only alphanumeric, dots, hyphens, colons, underscores
+    private static readonly Regex ValidSerialRegex = new(@"^[a-zA-Z0-9\.\-_:]+$", RegexOptions.Compiled);
+    // Allowlist regex for block device paths
+    private static readonly Regex ValidBlockPathRegex = new(@"^/dev/block/(?:by-name|bootdevice|platform)/[\w\-\.]+$|^/dev/block/[\w\-\.]+$|^/dev/bootimg$", RegexOptions.Compiled);
+    // Allowlist regex for package names
+    private static readonly Regex ValidPackageNameRegex = new(@"^[a-zA-Z0-9._\-]+$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Valida que un serial number sea seguro para usar en comandos ADB.
+    /// </summary>
+    public static bool IsValidSerial(string serial) =>
+        !string.IsNullOrWhiteSpace(serial) && ValidSerialRegex.IsMatch(serial);
+
+    /// <summary>
+    /// Valida que un path de partición sea seguro para usar en comandos shell.
+    /// </summary>
+    public static bool IsValidBlockPath(string path) =>
+        !string.IsNullOrWhiteSpace(path) && (ValidBlockPathRegex.IsMatch(path) || path.StartsWith("/data/local/tmp/"));
+
+    /// <summary>
+    /// Valida que un nombre de paquete Android sea seguro para usar en comandos shell.
+    /// </summary>
+    public static bool IsValidPackageName(string packageName) =>
+        !string.IsNullOrWhiteSpace(packageName) && ValidPackageNameRegex.IsMatch(packageName);
+
+    /// <summary>
+    /// Valida que un filename sea seguro para operaciones de backup (sin path traversal).
+    /// </summary>
+    public static string SanitizeFileName(string fileName)
+    {
+        // Remove path separators and null bytes
+        var sanitized = Path.GetFileName(fileName);
+        if (string.IsNullOrEmpty(sanitized)) return "unknown";
+        // Keep only safe characters
+        return Regex.Replace(sanitized, @"[^a-zA-Z0-9\._\-]", "_");
+    }
+
+    /// <summary>
+    /// Guard that throws if serial is not valid. Used before building ADB commands.
+    /// </summary>
+    private static void GuardValidSerial(string serial)
+    {
+        if (!IsValidSerial(serial))
+            throw new ArgumentException($"Serial number inválido o potencialmente malicioso: '{serial}'");
+    }
 
     public event Action<string>? OutputReceived;
     public event Action<string>? ErrorReceived;
@@ -34,7 +81,7 @@ public class AdbService
 
     public bool AdbExists => File.Exists(_adbPath);
 
-    public async Task InitializeAsync()
+    public async Task<bool> InitializeAsync()
     {
         if (!AdbExists)
         {
@@ -43,8 +90,30 @@ public class AdbService
 
         if (AdbExists)
         {
-            await Task.Run(() => ExecuteAdb("start-server"));
+            var result = await Task.Run(() => ExecuteAdb("start-server", dispatchOutput: false, timeoutMs: 10000));
+            if (!result.Success)
+            {
+                ErrorReceived?.Invoke($"Error al iniciar ADB server: {result.Error}");
+                return false;
+            }
+
+            // Verificar que ADB realmente funciona
+            await Task.Delay(500);
+            var checkResult = await Task.Run(() => ExecuteAdb("devices", dispatchOutput: false, timeoutMs: 5000));
+            if (!checkResult.Success)
+            {
+                ErrorReceived?.Invoke($"ADB no responde después de iniciar: {checkResult.Error}");
+                KillAdb();
+                return false;
+            }
         }
+        else
+        {
+            ErrorReceived?.Invoke("ADB no encontrado después de la descarga.");
+            return false;
+        }
+
+        return true;
     }
 
     private async Task DownloadPlatformToolsAsync()
@@ -77,6 +146,11 @@ public class AdbService
                             DownloadProgress?.Invoke((double)readBytes / totalBytes);
                     }
                 }
+
+                // platform-tools-latest is a rolling URL: hash changes every release.
+                // Integrity comes from HTTPS/TLS to dl.google.com; log hash for audit only.
+                var downloadedHash = CalculateFileSha256(tempZip);
+                OutputReceived?.Invoke($"  SHA256 del ZIP: {downloadedHash}");
 
                 OutputReceived?.Invoke("Extrayendo platform-tools...");
 
@@ -112,19 +186,35 @@ public class AdbService
         }
     }
 
-    public AdbCommandResult ExecuteAdb(string arguments, bool dispatchOutput = true, CancellationToken ct = default)
+    private static string CalculateFileSha256(string filePath)
     {
-        return ExecuteBinary(_adbPath, arguments, dispatchOutput, ct);
+        using var sha256 = System.Security.Cryptography.SHA256.Create();
+        using var stream = File.OpenRead(filePath);
+        var hash = sha256.ComputeHash(stream);
+        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
     }
 
-     public AdbCommandResult ExecuteFastboot(string arguments, bool dispatchOutput = true, CancellationToken ct = default)
+    public AdbCommandResult ExecuteAdb(string arguments, bool dispatchOutput = true, CancellationToken ct = default, int timeoutMs = 15000)
+    {
+        return ExecuteBinary(_adbPath, arguments, dispatchOutput, ct, timeoutMs: timeoutMs);
+    }
+
+     public AdbCommandResult ExecuteFastboot(string arguments, bool dispatchOutput = true, CancellationToken ct = default, int timeoutMs = 15000)
      {
-         return ExecuteBinary(_fastbootPath, arguments, dispatchOutput, ct, Encoding.UTF8);
+         return ExecuteBinary(_fastbootPath, arguments, dispatchOutput, ct, Encoding.UTF8, timeoutMs);
      }
 
-     private AdbCommandResult ExecuteBinary(string binaryPath, string arguments, bool dispatchOutput = true, CancellationToken ct = default, Encoding? outputEncoding = null)
+     private AdbCommandResult ExecuteBinary(string binaryPath, string arguments, bool dispatchOutput = true, CancellationToken ct = default, Encoding? outputEncoding = null, int timeoutMs = 15000)
      {
          var result = new AdbCommandResult();
+
+         // Guard: validate serial from arguments before executing
+         var serialMatch = Regex.Match(arguments, @"-s\s+(\S+)");
+         if (serialMatch.Success)
+         {
+             var serial = serialMatch.Groups[1].Value;
+             GuardValidSerial(serial);
+         }
 
          var binaryName = Path.GetFileNameWithoutExtension(binaryPath);
          CommandExecuting?.Invoke($"> {binaryName} {arguments}");
@@ -196,11 +286,24 @@ public class AdbService
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
-            if (!process.WaitForExit(15000))
+            var timeoutStr = timeoutMs >= 60000 ? $"{timeoutMs / 1000}s" : $"{timeoutMs}ms";
+            if (!process.WaitForExit(timeoutMs))
             {
-                try { process.Kill(entireProcessTree: true); } catch { }
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                    // Verify process actually died
+                    if (!process.WaitForExit(3000))
+                    {
+                        result.Success = false;
+                        result.Error = $"El proceso no pudo ser terminado ({binaryName})";
+                        return result;
+                    }
+                }
+                catch (InvalidOperationException) { } // Already exited
+                catch { }
                 result.Success = false;
-                result.Error = "El comando excedió el tiempo límite (15s)";
+                result.Error = $"El comando excedió el tiempo límite ({timeoutStr})";
                 return result;
             }
 
@@ -229,17 +332,17 @@ public class AdbService
 
     public List<string> GetConnectedDevices()
      {
-         var result = ExecuteAdb("devices -l", dispatchOutput: false);
+         var result = ExecuteAdb("devices -l", dispatchOutput: false, timeoutMs: 5000);
          if (!result.Success)
          {
              Debug.WriteLine($"[ADB] devices -l falló: {result.Error}");
              return new List<string>();
          }
 
-         Debug.WriteLine($"[ADB] devices -l output: \"{result.Output}\"");
-
          var devices = new List<string>();
          var lines = result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+         bool foundUnauthorized = false;
+         bool foundOffline = false;
 
         foreach (var line in lines.Skip(1))
         {
@@ -248,12 +351,38 @@ public class AdbService
             if (parts.Length < 2) continue;
 
             var state = parts[1].TrimEnd('\r');
-            if (state == "device" && !trimmed.Contains("unauthorized"))
+            var serial = parts[0];
+
+            if (state == "unauthorized")
             {
-                var serial = parts[0];
+                foundUnauthorized = true;
+                continue;
+            }
+            if (state == "offline")
+            {
+                foundOffline = true;
+                continue;
+            }
+            if (state == "device")
+            {
                 if (!string.IsNullOrEmpty(serial))
                     devices.Add(serial);
             }
+        }
+
+        if (foundUnauthorized && devices.Count == 0)
+            OutputReceived?.Invoke("⚠ Dispositivo detectado pero NO AUTORIZADO. Revisa la pantalla del teléfono y acepta la solicitud de depuración USB.");
+        if (foundOffline && devices.Count == 0)
+            OutputReceived?.Invoke("⚠ Dispositivo detectado pero OFFLINE. Prueba a reconectar el cable USB.");
+
+        var hasEntries = lines.Length > 1;
+        if (!hasEntries && !foundUnauthorized && !foundOffline)
+        {
+            OutputReceived?.Invoke("ℹ No se detectan dispositivos. Asegúrate de:");
+            OutputReceived?.Invoke("   1. Depuración USB activada en Opciones de desarrollador");
+            OutputReceived?.Invoke("   2. Aceptar la huella RSA en la pantalla del teléfono");
+            OutputReceived?.Invoke("   3. Tener el driver USB del fabricante instalado en el PC");
+            OutputReceived?.Invoke("   4. Probar con otro cable USB o puerto USB 2.0");
         }
 
         return devices;
@@ -261,7 +390,7 @@ public class AdbService
 
     public List<string> GetFastbootDevices()
     {
-        var result = ExecuteFastboot("devices", dispatchOutput: false);
+        var result = ExecuteFastboot("devices", dispatchOutput: false, timeoutMs: 5000);
         if (!result.Success) return new List<string>();
 
         var devices = new List<string>();
@@ -360,27 +489,62 @@ public class AdbService
                     ExecuteAdb($"-s {serial} shell getprop sys.oem_unlock_allowed"));
                 blUnlocked = unlockResult.Success && unlockResult.Output.Trim() == "1";
             }
+            else
+            {
+                var otherLocked = await Task.Run(() =>
+                    ExecuteAdb($"-s {serial} shell getprop ro.boot.other.locked"));
+                if (otherLocked.Success && otherLocked.Output.Trim() == "0")
+                    blUnlocked = true;
+            }
         }
         info.BootloaderUnlocked = blUnlocked;
 
         var ramResult = await Task.Run(() =>
-            ExecuteAdb($"-s {serial} shell cat /proc/meminfo"));
-        if (ramResult.Success)
-        {
-            foreach (var line in ramResult.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                ExecuteAdb($"-s {serial} shell cat /proc/meminfo"));
+            if (ramResult.Success)
             {
-                if (line.Trim().StartsWith("MemTotal:", StringComparison.OrdinalIgnoreCase))
+                foreach (var line in ramResult.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 {
-                    var match = Regex.Match(line, @"\d+");
-                    if (match.Success && long.TryParse(match.Value, out var kb))
-                        info.TotalRam = kb / 1024;
-                    break;
+                    if (line.Trim().StartsWith("MemTotal:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var match = Regex.Match(line, @"\d+");
+                        if (match.Success && long.TryParse(match.Value, out var kb))
+                            info.TotalRam = kb / 1024;
+                        break;
+                    }
                 }
             }
+
+            info.IsMediaTek = await DetectIsMediaTekAsync(serial);
+
+            var bootmode = await Task.Run(() =>
+                ExecuteAdb($"-s {serial} shell getprop ro.bootmode", dispatchOutput: false, timeoutMs: 5000));
+            var mode = bootmode.Success ? bootmode.Output.Trim().ToLowerInvariant() : "";
+            info.IsRecovery = mode is "recovery" or "recovery2";
+            info.IsFastboot = mode is "bootloader" or "fastboot";
+
+            return info;
         }
 
-        return info;
-    }
+        /// <summary>
+        /// Detects MediaTek SoC from board/hardware props (not ABI — ABI is arm64 on almost every phone).
+        /// </summary>
+        public async Task<bool> DetectIsMediaTekAsync(string serial)
+        {
+            GuardValidSerial(serial);
+            var props = new[] { "ro.board.platform", "ro.hardware", "ro.mediatek.platform", "ro.product.board" };
+            foreach (var prop in props)
+            {
+                var result = await Task.Run(() =>
+                    ExecuteAdb($"-s {serial} shell getprop {prop}", dispatchOutput: false, timeoutMs: 5000));
+                if (!result.Success) continue;
+                var v = result.Output.Trim().ToLowerInvariant();
+                if (v.Contains("mediatek") || v.Contains("mt6") || v.Contains("mt8") ||
+                    Regex.IsMatch(v, @"^mt\d{4}"))
+                    return true;
+            }
+            return false;
+        }
 
     public async Task<BootPartitionInfo?> FindBootPartitionAsync(string serial, CancellationToken ct = default)
     {
@@ -466,17 +630,17 @@ public class AdbService
         var tempDevicePath = "/data/local/tmp/boot.img";
 
         var ddResult = await Task.Run(() =>
-            ExecuteAdb($"-s {serial} shell su -c \"dd if={partition.Path} of={tempDevicePath} bs=1M 2>/dev/null\"", ct: ct), ct);
+            ExecuteAdb($"-s {serial} shell su -c \"dd if={partition.Path} of={tempDevicePath} bs=1M 2>/dev/null\"", ct: ct, timeoutMs: 120000), ct);
 
         if (!ddResult.Success && !ct.IsCancellationRequested)
             ddResult = await Task.Run(() =>
-                ExecuteAdb($"-s {serial} shell \"dd if={partition.Path} of={tempDevicePath} bs=1M 2>/dev/null\"", ct: ct), ct);
+                ExecuteAdb($"-s {serial} shell \"dd if={partition.Path} of={tempDevicePath} bs=1M 2>/dev/null\"", ct: ct, timeoutMs: 120000), ct);
 
         if (ddResult.Success && !ct.IsCancellationRequested)
         {
             var pullResult = await Task.Run(() =>
-                ExecuteAdb($"-s {serial} pull {tempDevicePath} \"{outputPath}\"", ct: ct), ct);
-            await Task.Run(() => ExecuteAdb($"-s {serial} shell \"rm -f {tempDevicePath}\""));
+                ExecuteAdb($"-s {serial} pull {tempDevicePath} \"{outputPath}\"", ct: ct, timeoutMs: 120000), ct);
+            await Task.Run(() => ExecuteAdb($"-s {serial} shell \"rm -f {tempDevicePath}\"", timeoutMs: 15000));
 
             if (pullResult.Success && File.Exists(outputPath))
             {
@@ -508,7 +672,7 @@ public class AdbService
             await process.StandardOutput.BaseStream.CopyToAsync(outputFile, 81920, ct);
 
             var error = await process.StandardError.ReadToEndAsync(ct);
-            process.WaitForExit(30000);
+            process.WaitForExit(120000);
 
             if (process.ExitCode == 0 && new FileInfo(outputPath).Length > 100000)
             {
@@ -535,19 +699,32 @@ public class AdbService
         return false;
     }
 
-    public AdbCommandResult PushFile(string serial, string localPath, string remotePath)
+    public AdbCommandResult PushFile(string serial, string localPath, string remotePath, int timeoutMs = 15000)
     {
-        return ExecuteAdb($"-s {serial} push \"{localPath}\" {remotePath}");
+        GuardValidSerial(serial);
+        if (!IsValidBlockPath(remotePath))
+        {
+            OutputReceived?.Invoke($"ERROR: Path remoto inválido: {remotePath}");
+            return new AdbCommandResult { Success = false, Error = "Path remoto no permitido" };
+        }
+        return ExecuteAdb($"-s {serial} push \"{localPath}\" {remotePath}", timeoutMs: timeoutMs);
     }
 
-    public AdbCommandResult PullFile(string serial, string remotePath, string localPath)
+    public AdbCommandResult PullFile(string serial, string remotePath, string localPath, int timeoutMs = 15000)
     {
-        return ExecuteAdb($"-s {serial} pull {remotePath} \"{localPath}\"");
+        GuardValidSerial(serial);
+        if (!IsValidBlockPath(remotePath))
+        {
+            OutputReceived?.Invoke($"ERROR: Path remoto inválido: {remotePath}");
+            return new AdbCommandResult { Success = false, Error = "Path remoto no permitido" };
+        }
+        return ExecuteAdb($"-s {serial} pull {remotePath} \"{localPath}\"", timeoutMs: timeoutMs);
     }
 
-    public AdbCommandResult Shell(string serial, string command)
+    public AdbCommandResult Shell(string serial, string command, int timeoutMs = 15000, CancellationToken ct = default)
     {
-        return ExecuteAdb($"-s {serial} shell \"{command}\"");
+        GuardValidSerial(serial);
+        return ExecuteAdb($"-s {serial} shell \"{command}\"", ct: ct, timeoutMs: timeoutMs);
     }
 
     public async Task<bool> ExecuteAdbRawAsync(string serial, string remotePath, string localPath, CancellationToken ct = default)
@@ -571,7 +748,7 @@ public class AdbService
             await process.StandardOutput.BaseStream.CopyToAsync(outputFile, 81920, ct);
 
             var error = await process.StandardError.ReadToEndAsync(ct);
-            process.WaitForExit(30000);
+            process.WaitForExit(120000);
 
             if (process.ExitCode == 0 && new FileInfo(localPath).Length > 100000)
                 return true;
@@ -590,6 +767,10 @@ public class AdbService
     public bool WaitForFastbootDevice(string serial, int timeoutSeconds = 30, CancellationToken ct = default)
     {
         OutputReceived?.Invoke("Esperando dispositivo en modo fastboot...");
+
+        // Matar servidor ADB para evitar que comandos ADB cuelguen mientras el dispositivo está en fastboot
+        ExecuteAdb("kill-server", dispatchOutput: false, timeoutMs: 3000);
+
         for (int i = 0; i < timeoutSeconds; i++)
         {
             if (ct.WaitHandle.WaitOne(1000) || ct.IsCancellationRequested)
@@ -608,25 +789,71 @@ public class AdbService
     {
         OutputReceived?.Invoke($"Flasheando {bootImgPath} vía fastboot...");
 
-        if (!string.IsNullOrEmpty(serial) && serial != "?")
+        if (string.IsNullOrEmpty(serial) || serial == "?")
         {
-            var result = ExecuteFastboot($"-s {serial} flash boot \"{bootImgPath}\"");
-            if (result.Success) return true;
-            OutputReceived?.Invoke($"  falló con serial, reintentando sin serial...");
+            OutputReceived?.Invoke("ERROR: No se puede flashear sin serial de dispositivo identificado.");
+            return false;
         }
 
-        var result2 = ExecuteFastboot($"flash boot \"{bootImgPath}\"");
-        return result2.Success;
+        if (!IsValidSerial(serial))
+        {
+            OutputReceived?.Invoke("ERROR: Serial de dispositivo inválido.");
+            return false;
+        }
+
+        var result = ExecuteFastboot($"-s {serial} flash boot \"{bootImgPath}\"", timeoutMs: 120000);
+        return result.Success;
+    }
+
+    public bool CheckAdbHealthy()
+    {
+        var result = ExecuteAdb("devices", dispatchOutput: false, timeoutMs: 5000);
+        return result.Success;
+    }
+
+    public string? DiagnoseAdbIssue()
+    {
+        var result = ExecuteAdb("devices", dispatchOutput: false, timeoutMs: 5000);
+        if (result.Success)
+            return null;
+
+        if (result.Error.Contains("excedió el tiempo", StringComparison.OrdinalIgnoreCase)
+            || result.Error.Contains("timeout", StringComparison.OrdinalIgnoreCase))
+            return "ADB no responde. El servidor puede estar bloqueado. Usa 'Reiniciar ADB'.";
+
+        if (result.Error.Contains("cannot connect to daemon", StringComparison.OrdinalIgnoreCase))
+            return "ADB no pudo conectar con el servidor. Prueba a reiniciar ADB.";
+
+        return $"ADB error: {result.Error}";
     }
 
     public void KillAdb()
     {
-        ExecuteAdb("kill-server");
+        ExecuteAdb("kill-server", dispatchOutput: false, timeoutMs: 3000);
+    }
+
+    public async Task RestartAdbAsync()
+    {
+        KillAdb();
+        await Task.Delay(500);
+        await Task.Run(() => ExecuteAdb("start-server", dispatchOutput: false, timeoutMs: 5000));
+    }
+
+    public void RestartAdb()
+    {
+        KillAdb();
+        Task.Delay(500).Wait();
+        ExecuteAdb("start-server", dispatchOutput: false, timeoutMs: 5000);
     }
 
     public void RebootToBootloader(string serial)
     {
-        ExecuteAdb($"-s {serial} reboot bootloader");
+        OutputReceived?.Invoke("Enviando comando reboot bootloader...");
+        var result = ExecuteAdb($"-s {serial} reboot bootloader", timeoutMs: 8000);
+        if (!result.Success)
+        {
+            OutputReceived?.Invoke("  ADB ya no responde (esperado: el dispositivo está reiniciando).");
+        }
     }
 
     public void RebootToRecovery(string serial)
@@ -641,19 +868,28 @@ public class AdbService
 
     public void FastbootReboot(string serial)
     {
-        ExecuteFastboot($"-s {serial} reboot");
+        ExecuteFastboot($"-s {serial} reboot", timeoutMs: 30000);
     }
 
     public AdbCommandResult CheckBootloaderUnlock(string serial)
     {
-        var result = ExecuteFastboot($"-s {serial} oem device-info 2>/dev/null");
+        var result = ExecuteFastboot($"-s {serial} oem device-info 2>/dev/null", timeoutMs: 30000);
         if (!result.Success)
-            result = ExecuteFastboot($"-s {serial} getvar unlocked 2>/dev/null");
+            result = ExecuteFastboot($"-s {serial} getvar unlocked 2>/dev/null", timeoutMs: 30000);
         return result;
     }
 
     public AdbCommandResult InstallApk(string serial, string apkPath)
     {
-        return ExecuteAdb($"-s {serial} install -r \"{apkPath}\"");
+        return ExecuteAdb($"-s {serial} install -r \"{apkPath}\"", timeoutMs: 60000);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        try { KillAdb(); } catch { }
+        _httpClient?.Dispose();
+        GC.SuppressFinalize(this);
     }
 }

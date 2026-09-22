@@ -30,11 +30,28 @@ public class StatusToColorConverter : IValueConverter
 {
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
     {
-        return value?.ToString() switch
+        var text = value?.ToString() ?? string.Empty;
+        if (text.StartsWith("Conectado", StringComparison.OrdinalIgnoreCase))
+            return new SolidColorBrush(Color.FromRgb(0x66, 0xBB, 0x6A));
+        if (text.StartsWith("Desconectado", StringComparison.OrdinalIgnoreCase))
+            return new SolidColorBrush(Color.FromRgb(0xEF, 0x53, 0x50));
+        return new SolidColorBrush(Color.FromRgb(0xFF, 0xA7, 0x26));
+    }
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+        throw new NotImplementedException();
+}
+
+public class RiskToColorConverter : IValueConverter
+{
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        var risk = value?.ToString() ?? "";
+        return risk switch
         {
-            "Conectado" => new SolidColorBrush(Color.FromRgb(0x66, 0xBB, 0x6A)),
-            "Desconectado" => new SolidColorBrush(Color.FromRgb(0xEF, 0x53, 0x50)),
-            _ => new SolidColorBrush(Color.FromRgb(0xFF, 0xA7, 0x26))
+            "Alto" => new SolidColorBrush(Color.FromRgb(0xEF, 0x53, 0x50)),
+            "Medio" => new SolidColorBrush(Color.FromRgb(0xFF, 0xA7, 0x26)),
+            _ => new SolidColorBrush(Color.FromRgb(0x2E, 0x7D, 0x32)),
         };
     }
 

@@ -12,6 +12,7 @@
     <Description>Herramienta para rootear dispositivos Android desde PC</Description>
     <StartupObject>PCAndroidRooter.App</StartupObject>
     <ApplicationIcon>Resources\android_capsule_icon.ico</ApplicationIcon>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
   <ItemGroup>
