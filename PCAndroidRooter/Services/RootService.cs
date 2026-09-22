@@ -201,13 +201,9 @@ case RootMethodType.CustomRecovery:
         LogOk($"Android: {deviceInfo.AndroidVersion} | ABI: {deviceInfo.Abi}");
         LogOk($"Batería: {deviceInfo.BatteryLevel}");
 
-        // Verificar batería mínima
-        if (int.TryParse(deviceInfo.BatteryLevel.Replace("%", "").Trim(), out var battery) && battery < 30)
-        {
-            LogError($"Batería insuficiente ({battery}%). Mínimo requerido: 30%.");
-            Log("  Conecta el cargador antes de continuar para evitar apagado durante el flash.");
+        // Verificar batería mínima (fail-closed: sin lectura fiable no se procede)
+        if (!await EnsureMinBatteryAsync(serial, deviceInfo))
             return RootMethodStatus.Failed;
-        }
 
         // Verificar que no esté en recovery/fastboot
         if (deviceInfo.IsRecovery)
@@ -325,8 +321,8 @@ case RootMethodType.CustomRecovery:
         // ════════════════════════════════════════════════════
         Log("\nPASO 4: Extrayendo boot.img del dispositivo...");
         var bootImgLocal = Path.Combine(_magiskService.MagiskDir, "boot.img");
-        var bootImgBackup = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
-            $"boot_original_{deviceInfo.Model}_{DateTime.Now:yyyyMMdd_HHmmss}.img");
+            var bootImgBackup = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+            $"boot_original_{AdbService.SanitizeFileName(deviceInfo.Model)}_{DateTime.Now:yyyyMMdd_HHmmss}.img");
 
         var extracted = await _adbService.ExtractBootImgAsync(serial, bootPart, bootImgLocal, ct);
         if (!extracted)
@@ -560,7 +556,7 @@ case RootMethodType.CustomRecovery:
         // ════════════════════════════════════════════════════
         Log("\nPASO 8: Descargando boot.img parcheado...");
         var patchedImgLocal = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
-            $"magisk_patched_{deviceInfo.Model}_{DateTime.Now:yyyyMMdd_HHmmss}.img");
+            $"magisk_patched_{AdbService.SanitizeFileName(deviceInfo.Model)}_{DateTime.Now:yyyyMMdd_HHmmss}.img");
 
         // Solo new-boot.img: boot_to_patch.img es el ORIGINAL SIN PARCHAR —
         // usarlo como fallback arriesga flashear/restaurar un boot sin Magisk.
@@ -655,7 +651,8 @@ case RootMethodType.CustomRecovery:
             Log("");
             Log("  Después del reinicio, busca la app Magisk.");
             _adbService.RestartAdb();
-            return RootMethodStatus.Success;
+            // El root NO está hecho aún: requiere flasheo manual con ODIN
+            return RootMethodStatus.WaitingDevice;
         }
 
         // ════════════════════════════════════════════════════
@@ -864,12 +861,34 @@ private async Task<RootMethodStatus> AdbExploitRootAsync(string serial, Cancella
             Log($"Android: {deviceInfo.AndroidVersion} | ABI: {deviceInfo.Abi}");
         }
 
+        // 'adb root' reinicia adbd en builds userdebug/eng (desconecta el device
+        // a mitad del escaneo). Solo intentarlo si ro.debuggable=1, y esperar a
+        // que adbd vuelva antes de comprobar su.
         Log("\n[1/5] Probando 'adb root'...");
-        var adbRoot = _adbService.ExecuteAdb($"-s {serial} root", ct: ct);
-        if (adbRoot.Success && (adbRoot.Output.Contains("already running as root") ||
-                                adbRoot.Output.Contains("restarting") ||
-                                adbRoot.Output.Contains("adbd is now running as root")))
+        var debuggable = _adbService.ExecuteAdb($"-s {serial} shell getprop ro.debuggable", ct: ct, timeoutMs: 5000);
+        var isDebuggableBuild = debuggable.Success && debuggable.Output.Trim() == "1";
+
+        AdbCommandResult? adbRoot = null;
+        if (isDebuggableBuild)
+            adbRoot = _adbService.ExecuteAdb($"-s {serial} root", ct: ct, timeoutMs: 10000);
+
+        if (adbRoot != null && adbRoot.Success &&
+            (adbRoot.Output.Contains("already running as root") ||
+             adbRoot.Output.Contains("restarting") ||
+             adbRoot.Output.Contains("adbd is now running as root")))
         {
+            if (adbRoot.Output.Contains("restarting"))
+            {
+                Log("  adbd reiniciando — esperando a que el dispositivo vuelva...");
+                for (int i = 0; i < 20 && !ct.IsCancellationRequested; i++)
+                {
+                    await Task.Delay(500, ct);
+                    if (_adbService.GetConnectedDevices().Contains(serial))
+                        break;
+                }
+                _adbService.RestartAdb();
+            }
+
             var suCheck = _adbService.ExecuteAdb($"-s {serial} shell su -c id", ct: ct);
             if (suCheck.Success && (suCheck.Output.Contains("uid=0") || suCheck.Output.Contains("root")))
             {
@@ -879,7 +898,14 @@ private async Task<RootMethodStatus> AdbExploitRootAsync(string serial, Cancella
                 return RootMethodStatus.Success;
             }
         }
-        Log("  'adb root' no disponible en este dispositivo.");
+        else if (!isDebuggableBuild)
+        {
+            Log("  Build de producción (ro.debuggable=0) — 'adb root' no disponible; omitido.");
+        }
+        else
+        {
+            Log("  'adb root' no disponible en este dispositivo.");
+        }
 
         ct.ThrowIfCancellationRequested();
 
@@ -961,6 +987,31 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         return RootMethodStatus.Failed;
     }
 
+    /// <summary>
+    /// Gate de batería fail-closed: exige lectura fiable ≥ 30% antes de
+    /// procesos largos (wipe/flash) para no apagarse a mitad del proceso.
+    /// Antes un "Desconocido" saltaba el check (fail-open).
+    /// </summary>
+    private async Task<bool> EnsureMinBatteryAsync(string serial, DeviceInfo? deviceInfo = null)
+    {
+        deviceInfo ??= await _adbService.GetDeviceInfoAsync(serial);
+        var raw = (deviceInfo?.BatteryLevel ?? string.Empty).Replace("%", "").Trim();
+        if (!int.TryParse(raw, out var battery))
+        {
+            LogError($"No se pudo leer el nivel de batería ({deviceInfo?.BatteryLevel ?? "sin datos"}).");
+            Log("  Se requiere batería ≥ 30% para no apagarse a mitad del proceso.");
+            Log("  Revisa la conexión ADB/USB y el teléfono, y reintenta.");
+            return false;
+        }
+        if (battery < 30)
+        {
+            LogError($"Batería insuficiente ({battery}%). Mínimo requerido: 30%.");
+            Log("  Conecta el cargador antes de continuar para evitar apagado durante el flash.");
+            return false;
+        }
+        return true;
+    }
+
     private async Task<RootMethodStatus> UnlockBootloaderAsync(string serial, CancellationToken ct, bool skipBackup = false)
     {
         Log("═══════════════════════════════════════════");
@@ -974,6 +1025,10 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
 
         var manufacturer = _adbService.ExecuteAdb($"-s {serial} shell getprop ro.product.manufacturer").Output.Trim().ToLowerInvariant();
         Log($" Fabricante detectado: {manufacturer}");
+
+        // Gate de batería antes de backup/wipe (fail-closed)
+        if (!await EnsureMinBatteryAsync(serial))
+            return RootMethodStatus.Failed;
 
         if (manufacturer == "samsung")
         {
@@ -1009,7 +1064,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             Log("  Si prefieres hacerlo manual, cierra esta herramienta y sigue los pasos.\n");
         }
 
-        var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", serial);
+        var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", AdbService.SanitizeSerialForPath(serial));
         Directory.CreateDirectory(backupDir);
 
         Dictionary<string, string> apkResult = new();
@@ -1062,6 +1117,10 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             Log($"\n✅ Backup completado en: {backupDir} ({backupFileCount} archivos)");
             Log("Guarda esta carpeta en un lugar seguro antes de continuar.");
         }
+
+        // Cancelación durante el backup no debe llegar hasta aquí tragada:
+        // abortar ANTES de la fase de wipe.
+        ct.ThrowIfCancellationRequested();
 
         Log("\n=== FASE 2: Verificación de OEM Unlock ===");
         Log("\nVerificando si OEM Unlock está habilitado...");
@@ -1123,7 +1182,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             Log("  El backup está disponible en: " + backupDir);
 
             _adbService.RestartAdb();
-            return RootMethodStatus.Success;
+            return RootMethodStatus.WaitingDevice;
         }
 
         Log("\n=== FASE 3: Desbloqueo del bootloader ===");
@@ -1158,7 +1217,8 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         Log("  Debes confirmar con las teclas de volumen (Volumen+)");
         Log("  y el botón de encendido en la pantalla del teléfono.");
 
-        var unlockResult = _adbService.ExecuteFastboot($"-s {serial} oem unlock");
+        // Timeout 120s: el usuario debe confirmar físicamente en la pantalla del teléfono
+        var unlockResult = _adbService.ExecuteFastboot($"-s {serial} oem unlock", timeoutMs: 120000);
         if (unlockResult.Success)
             goto UnlockSuccess;
 
@@ -1167,7 +1227,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         Log("  Método 2: fastboot flashing unlock...");
         Log("  ⚠ REVISA LA PANTALLA DEL TELÉFONO — posible confirmación requerida");
 
-        unlockResult = _adbService.ExecuteFastboot($"-s {serial} flashing unlock");
+        unlockResult = _adbService.ExecuteFastboot($"-s {serial} flashing unlock", timeoutMs: 120000);
         if (unlockResult.Success)
             goto UnlockSuccess;
 
@@ -1175,7 +1235,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
 
         Log("  Método 3: fastboot flashing unlock_critical...");
 
-        unlockResult = _adbService.ExecuteFastboot($"-s {serial} flashing unlock_critical");
+        unlockResult = _adbService.ExecuteFastboot($"-s {serial} flashing unlock_critical", timeoutMs: 120000);
         if (unlockResult.Success)
             goto UnlockSuccess;
 
@@ -1215,6 +1275,15 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         Log("  Esto es normal — configúralo de nuevo como dispositivo nuevo.");
         Log($"  El backup está disponible en: {backupDir}");
 
+        if (skipBackup)
+        {
+            // NO reescribir backup_summary.json con hashes vacíos (apkResult está
+            // vacío en skipBackup) — destruiría el resumen real del backup previo.
+            if (File.Exists(Path.Combine(backupDir, "backup_summary.json")))
+                Log("  Resumen del backup existente conservado (skipBackup).");
+        }
+        else
+        {
         // Create backup summary file
         try
         {
@@ -1252,6 +1321,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         {
             Log($"  Error al crear resumen: {ex.Message}");
         }
+        } // fin else (!skipBackup)
 
         Log("\nReiniciando dispositivo...");
         _adbService.FastbootReboot(serial);
@@ -1331,6 +1401,10 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
                     }
                 }
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 Log($"    Error al respaldar apps: {ex.Message}");
@@ -1347,6 +1421,15 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         using var stream = File.OpenRead(filePath);
         var hash = sha256.ComputeHash(stream);
         return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+    }
+
+    // Hash estable entre procesos/ejecuciones (GetHashCode varía por proceso →
+    // nombres de backup no deterministas al restaurar en otra sesión).
+    private static string StableNameHash(string input)
+    {
+        var bytes = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(input));
+        return Convert.ToHexString(bytes.AsSpan(0, 4));
     }
 
     private async Task<List<string>> BackupMediaAsync(string serial, string backupDir, CancellationToken ct)
@@ -1381,8 +1464,8 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
                         var fileName = AdbService.SanitizeFileName(Path.GetFileName(remotePath));
                         if (string.IsNullOrEmpty(fileName) || fileName == "unknown") continue;
 
-                        // Use unique filename to prevent overwrite: hash prefix + original name
-                        var uniqueName = $"{Math.Abs(string.GetHashCode(remotePath)):X8}_{fileName}";
+                        // Use unique filename to prevent overwrite: hash estable + original name
+                        var uniqueName = $"{StableNameHash(remotePath)}_{fileName}";
                         var targetPath = Path.Combine(mediaDir, uniqueName);
                         var pullResult = _adbService.PullFile(serial, remotePath, targetPath);
                         if (pullResult.Success)
@@ -1390,6 +1473,10 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
                             files.Add(uniqueName);
                         }
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch { }
             }
@@ -1431,8 +1518,8 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
                     var fileName = AdbService.SanitizeFileName(Path.GetFileName(remotePath));
                     if (string.IsNullOrEmpty(fileName) || fileName == "unknown") continue;
 
-                    // Use unique filename to prevent overwrite
-                    var uniqueName = $"{Math.Abs(string.GetHashCode(remotePath)):X8}_{fileName}";
+                    // Use unique filename to prevent overwrite (hash estable entre procesos)
+                    var uniqueName = $"{StableNameHash(remotePath)}_{fileName}";
                     var targetPath = Path.Combine(docsDir, uniqueName);
                     var pullResult = _adbService.PullFile(serial, remotePath, targetPath);
                     if (pullResult.Success)
@@ -1441,7 +1528,11 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
                     }
                 }
             }
-            catch { }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch { }
         }
 
         Log($"    Documentos respaldados: {files.Count}");
@@ -1499,6 +1590,10 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             }
 
             Log("    NOTA: Para backup completo de SMS, usa una app como 'SMS Backup & Restore'.");
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -1847,13 +1942,9 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         LogOk($"Android: {androidVersion} | ABI: {abi}");
         LogOk($"Batería: {deviceInfo.BatteryLevel}");
 
-        // Verificar batería mínima
-        if (int.TryParse(deviceInfo.BatteryLevel.Replace("%", "").Trim(), out var battery) && battery < 30)
-        {
-            LogError($"Batería muy baja ({battery}%). Conecta el cargador antes de continuar.");
-            Log("  Se necesita mínimo 30% de batería para proceder de forma segura.");
+        // Verificar batería mínima (fail-closed: sin lectura fiable no se procede)
+        if (!await EnsureMinBatteryAsync(serial, deviceInfo))
             return RootMethodStatus.Failed;
-        }
         ct.ThrowIfCancellationRequested();
 
         // ── FASE 2: Verificar si ya tiene root ──
@@ -1914,6 +2005,11 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             // Desbloquear bootloader (backup ya creado arriba → skip)
             Log("\n▸ FASE 3b: Desbloqueando bootloader...");
             var unlockResult = await UnlockBootloaderAsync(serial, ct, skipBackup: true);
+            if (unlockResult == RootMethodStatus.WaitingDevice)
+            {
+                // Flujo manual (Samsung/otros): el usuario completa pasos y reejecuta
+                return unlockResult;
+            }
             if (unlockResult != RootMethodStatus.Success)
             {
                 LogError("No se pudo desbloquear el bootloader.");
@@ -1928,8 +2024,22 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             Log("  Esto puede tardar 5-10 minutos en el primer arranque.");
 
             // Esperar a que el dispositivo vuelva
-            await WaitForDeviceReadyAsync(serial, ct);
+            var deviceBack = await WaitForDeviceReadyAsync(serial, ct);
             ct.ThrowIfCancellationRequested();
+            if (!deviceBack)
+            {
+                // NO continuar a Magisk Patch: la USB debug puede estar apagada
+                // tras el wipe y el "éxito" sería falso.
+                LogError("El dispositivo no volvió a responder tras el desbloqueo/wipe.");
+                Log("  Pasos a seguir manualmente:");
+                Log("  1. Configura el teléfono de nuevo (asistente de Android)");
+                Log("  2. Activa 'Depuración USB' en Opciones de desarrollador");
+                Log("  3. Conecta al PC y pulsa 'Refresh'");
+                Log("  4. Ejecuta 'Magisk Patch' para completar el root");
+                if (backupResult != null)
+                    Log($"  Backup: {backupResult}");
+                return RootMethodStatus.Failed;
+            }
         }
         else
         {
@@ -2020,7 +2130,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
     {
         try
         {
-            var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", serial);
+            var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", AdbService.SanitizeSerialForPath(serial));
             Directory.CreateDirectory(backupDir);
 
             Log("  [1/4] Backup de apps...");
@@ -2089,6 +2199,10 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
 
             return backupDir;
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             LogWarning($"  Error creando backup: {ex.Message}");
@@ -2096,7 +2210,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         }
     }
 
-    private async Task WaitForDeviceReadyAsync(string serial, CancellationToken ct, int maxWaitSeconds = 300)
+    private async Task<bool> WaitForDeviceReadyAsync(string serial, CancellationToken ct, int maxWaitSeconds = 300)
     {
         Log("  Esperando a que el dispositivo se reinicie...");
         Log("  (puede tardar hasta 5 minutos después del formateo)");
@@ -2106,7 +2220,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         for (int i = 0; i < maxWaitSeconds; i++)
         {
             if (ct.IsCancellationRequested)
-                return;
+                return false;
 
             await Task.Delay(1000, ct);
 
@@ -2121,13 +2235,14 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
                 if (check.Success && check.Output.Trim() == "1")
                 {
                     LogOk("Dispositivo listo y respondiendo.");
-                    return;
+                    return true;
                 }
             }
         }
 
         LogWarning("Tiempo de espera agotado. El dispositivo puede estar aún reiniciándose.");
         Log("  Si el dispositivo no aparece, reconecta el cable USB y pulsa Refresh.");
+        return false;
     }
 
     private async Task<RootMethodStatus> SamsungUnlockFlowAsync(string serial, DeviceInfo deviceInfo, CancellationToken ct)
@@ -2201,7 +2316,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         Log("  (La aplicación esperará a que reconectes el dispositivo)");
 
         _adbService.RestartAdb();
-        return RootMethodStatus.Success;
+        return RootMethodStatus.WaitingDevice;
     }
 
     private async Task<RootMethodStatus> TemporaryRootAsync(string serial, CancellationToken ct)
@@ -2281,6 +2396,10 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
 
         Log($"Dispositivo: {deviceInfo.Manufacturer} {deviceInfo.Model}");
         Log($"Android: {deviceInfo.AndroidVersion} | ABI: {deviceInfo.Abi}");
+
+        // Gate de batería antes del parche/arranque — fail-closed
+        if (!await EnsureMinBatteryAsync(serial, deviceInfo))
+            return RootMethodStatus.Failed;
 
         ct.ThrowIfCancellationRequested();
 
@@ -2419,6 +2538,17 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         }
         Log($"  boot.img parcheado: {patchedImgLocal}");
 
+        // Validación anti-brick: no arrancar con un binario sin verificar
+        var fastbootPatchedValidation = BootImageValidator.ValidatePatched(patchedImgLocal, bootImgLocal);
+        if (fastbootPatchedValidation.Status != BootImageValidator.ValidationStatus.Valid)
+        {
+            LogError($"VALIDACIÓN FALLIDA: {fastbootPatchedValidation.Message}");
+            Log("  No se usará un boot.img que no pasa las verificaciones de seguridad.");
+            Log($"  Original (si existe): {bootImgLocal}");
+            return RootMethodStatus.Failed;
+        }
+        LogOk($"  boot.img parcheado válido ({fastbootPatchedValidation.FileSize / 1024 / 1024} MB)");
+
         ct.ThrowIfCancellationRequested();
 
         Log("\nPASO 8: Arrancando con boot.img parcheado vía fastboot boot...");
@@ -2444,21 +2574,53 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         Log("  Si se queda en el logo o no arranca, mantén presionado");
         Log("  el botón de encendido 10s para reiniciar.");
 
-        var bootResult = _adbService.ExecuteFastboot($"-s {serial} boot \"{patchedImgLocal}\"", timeoutMs: 60000);
-        if (!bootResult.Success)
-        {
-            Log($"  Error: {bootResult.Error}");
-            Log("  Intentando sin serial...");
-            bootResult = _adbService.ExecuteFastboot($"boot \"{patchedImgLocal}\"", timeoutMs: 60000);
-        }
+        var fbTarget = _adbService.ResolveFastbootTarget(serial);
+        var bootResult = _adbService.ExecuteFastboot($"-s {fbTarget} boot \"{patchedImgLocal}\"", timeoutMs: 60000);
+        // Sin fallback "sin serial": con varios dispositivos conectados podría
+        // arrancar el equipo equivocado (ResolveFastbootTarget ya cubre "?").
 
         if (bootResult.Success)
         {
-            Log("═══════════════════════════════════════════");
-            Log("  ✅ ROOT TEMPORAL INICIADO");
-            Log("═══════════════════════════════════════════");
+            Log("  fastboot boot aceptado. Esperando arranque y verificando root...");
             _adbService.RestartAdb();
-            Log("  El dispositivo debería arrancar con Magisk temporal.");
+
+            // Verificar root REAL antes de reportar éxito (H8)
+            bool tempRootVerified = false;
+            for (int i = 0; i < 90 && !ct.IsCancellationRequested; i++)
+            {
+                await Task.Delay(1000, ct);
+                var devs = _adbService.GetConnectedDevices();
+                if (!devs.Contains(serial)) continue;
+
+                var bootCheck = _adbService.ExecuteAdb(
+                    $"-s {serial} shell getprop sys.boot_completed", ct: ct, timeoutMs: 5000);
+                if (!bootCheck.Success || bootCheck.Output.Trim() != "1") continue;
+
+                // Magisk puede tardar unos segundos en levantar su daemon
+                for (int attempt = 0; attempt < 3 && !ct.IsCancellationRequested; attempt++)
+                {
+                    if (DetectIfRooted(serial))
+                    {
+                        tempRootVerified = true;
+                        break;
+                    }
+                    await Task.Delay(5000, ct);
+                }
+                break;
+            }
+
+            if (!tempRootVerified)
+            {
+                LogWarning("El dispositivo arrancó pero el root temporal NO se verificó.");
+                Log("  Revisa la pantalla del teléfono y la app Magisk si aparece.");
+                Log("  Usa 'Magisk Patch' para un root permanente.");
+                return RootMethodStatus.Failed;
+            }
+
+            Log("═══════════════════════════════════════════");
+            Log("  ✅ ROOT TEMPORAL INICIADO Y VERIFICADO");
+            Log("═══════════════════════════════════════════");
+            Log("  El dispositivo arrancó con Magisk temporal.");
             Log("  ⚠ El root se pierde al reiniciar.");
             Log("  Si todo funciona bien, usa 'Magisk Patch' para hacerlo permanente.");
             return RootMethodStatus.Success;
@@ -2543,6 +2705,10 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         Log($"Android: {deviceInfo?.AndroidVersion}");
         Log("");
 
+        // Gate de batería antes del backup y el unlock MTK (wipe) — fail-closed
+        if (!await EnsureMinBatteryAsync(serial, deviceInfo))
+            return RootMethodStatus.Failed;
+
         var mtkDir = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "mtkclient"));
         var venvPython = Path.Combine(mtkDir, "venv", "Scripts", "python.exe");
 
@@ -2562,7 +2728,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         LogOk("Entorno MTKClient verificado.");
 
         Log("\n=== FASE 1: Backup de datos ===");
-        var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", serial);
+        var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", AdbService.SanitizeSerialForPath(serial));
         Directory.CreateDirectory(backupDir);
 
         Log("\n[1/4] Backup de apps instaladas...");
@@ -2677,7 +2843,21 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
 
             using var procCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             procCts.CancelAfter(TimeSpan.FromSeconds(120));
-            await proc.WaitForExitAsync(procCts.Token);
+            try
+            {
+                await proc.WaitForExitAsync(procCts.Token);
+            }
+            finally
+            {
+                // Matar el proceso en timeout/cancelación: un MTKClient huérfano
+                // puede dejar el dispositivo colgado en BROM.
+                try
+                {
+                    if (!proc.HasExited)
+                        proc.Kill(entireProcessTree: true);
+                }
+                catch { /* ya terminó o sin permisos */ }
+            }
 
             Log("");
 

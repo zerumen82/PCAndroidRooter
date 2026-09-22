@@ -36,6 +36,13 @@ public class DeviceDetectionService : IDisposable
         _uiContext.Post(s =>
         {
             if (_disposed) return;
+            // Disponer el timer anterior para no acumular handlers si Start se repite
+            if (_pollTimer != null)
+            {
+                _pollTimer.Elapsed -= OnPollTimerElapsed;
+                _pollTimer.Stop();
+                _pollTimer.Dispose();
+            }
             _pollTimer = new Timer(_intervalMs);
             _pollTimer.Elapsed += OnPollTimerElapsed;
             _pollTimer.AutoReset = true;

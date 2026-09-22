@@ -5,3 +5,12 @@ obj/
 .vs/
 .DS_Store
 dist/*.pdb
+/dist/
+/out_exe/
+/mtkclient/
+/Resources/
+/create_android_icon.ps1
+/generate_icon.ps1
+/extract_notepad_icon.ps1
+/backup/
+magisk_work/

@@ -4,6 +4,7 @@
  using System.Diagnostics;
  using System.IO;
  using System.IO.Compression;
+ using System.Linq;
  using System.Net.Http;
  using System.Text;
  using System.Text.RegularExpressions;
@@ -35,10 +36,31 @@ namespace PCAndroidRooter.Services;
         RegexOptions.Compiled);
 
     /// <summary>
-    /// Valida que un serial number sea seguro para usar en comandos ADB.
+    /// Valida que un serial number sea seguro para usar en comandos ADB
+    /// y como segmento de ruta de backup (rechaza path traversal "..").
     /// </summary>
     public static bool IsValidSerial(string serial) =>
-        !string.IsNullOrWhiteSpace(serial) && ValidSerialRegex.IsMatch(serial);
+        !string.IsNullOrWhiteSpace(serial) &&
+        !serial.Contains("..", StringComparison.Ordinal) &&
+        !serial.Contains('\0') &&
+        ValidSerialRegex.IsMatch(serial);
+
+    /// <summary>
+    /// Serial seguro para usar como nombre de carpeta/archivo en Windows
+    /// (reemplaza ':' y otros caracteres inválidos de ruta).
+    /// </summary>
+    public static string SanitizeSerialForPath(string serial)
+    {
+        if (string.IsNullOrWhiteSpace(serial)) return "unknown";
+        var chars = serial.Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.' ? c : '_');
+        var safe = new string(chars.ToArray());
+        // Quitar puntos finales (Windows rechaza "nombre.") y carpeta-travel
+        safe = safe.TrimEnd('.');
+        if (safe.Length == 0 || safe == "." || safe == ".." ||
+            safe.Contains("..", StringComparison.Ordinal))
+            return "unknown";
+        return safe;
+    }
 
     /// <summary>
     /// Valida que un path de partición sea seguro para usar en comandos shell.
@@ -168,6 +190,12 @@ namespace PCAndroidRooter.Services;
                         if (totalBytes > 0)
                             DownloadProgress?.Invoke((double)readBytes / totalBytes);
                     }
+
+                    // Validar que la descarga estuvo completa
+                    if (totalBytes > 0 && readBytes != totalBytes)
+                        throw new IOException($"Descarga incompleta: {readBytes}/{totalBytes} bytes.");
+                    if (readBytes == 0)
+                        throw new IOException("El ZIP descargado está vacío.");
                 }
 
                 // platform-tools-latest is a rolling URL: hash changes every release.
@@ -177,17 +205,43 @@ namespace PCAndroidRooter.Services;
 
                 OutputReceived?.Invoke("Extrayendo platform-tools...");
 
-                var baseExtractDir = AppDomain.CurrentDomain.BaseDirectory;
-                if (Directory.Exists(extractDir))
-                    Directory.Delete(extractDir, recursive: true);
+                // Extraer a un staging temporal y validar ANTES de borrar la instalación
+                // actual: así un ZIP corrupto no deja la app sin adb/fastboot.
+                var stagingRoot = Path.Combine(Path.GetTempPath(), $"pt-staging-{Guid.NewGuid():N}");
+                try
+                {
+                    using (var zip = ZipFile.OpenRead(tempZip))
+                    {
+                        if (zip.Entries.Count == 0)
+                            throw new InvalidDataException("El ZIP está vacío.");
+                    }
 
-                ZipFile.ExtractToDirectory(tempZip, baseExtractDir, overwriteFiles: true);
+                    ZipFile.ExtractToDirectory(tempZip, stagingRoot, overwriteFiles: true);
 
-                _adbPath = Path.Combine(baseExtractDir, "platform-tools", "adb.exe");
-                _fastbootPath = Path.Combine(baseExtractDir, "platform-tools", "fastboot.exe");
+                    var stagedToolsDir = Path.Combine(stagingRoot, "platform-tools");
+                    if (!File.Exists(Path.Combine(stagedToolsDir, "adb.exe")) ||
+                        !File.Exists(Path.Combine(stagedToolsDir, "fastboot.exe")))
+                        throw new InvalidDataException("El ZIP no contiene platform-tools/adb.exe y fastboot.exe.");
 
-                OutputReceived?.Invoke("Platform-tools instalados correctamente.");
-                return;
+                    if (Directory.Exists(extractDir))
+                        Directory.Delete(extractDir, recursive: true);
+                    Directory.Move(stagedToolsDir, extractDir);
+
+                    _adbPath = Path.Combine(extractDir, "adb.exe");
+                    _fastbootPath = Path.Combine(extractDir, "fastboot.exe");
+
+                    OutputReceived?.Invoke("Platform-tools instalados correctamente.");
+                    return;
+                }
+                finally
+                {
+                    try
+                    {
+                        if (Directory.Exists(stagingRoot))
+                            Directory.Delete(stagingRoot, recursive: true);
+                    }
+                    catch { /* staging en Temp — ignorar */ }
+                }
             }
             catch (Exception ex)
             {
@@ -815,7 +869,11 @@ namespace PCAndroidRooter.Services;
                 return false;
             }
             var devices = GetFastbootDevices();
-            if (devices.Contains(serial) || devices.Contains("?"))
+            if (devices.Contains(serial))
+                return true;
+            // Algunos bootloaders reportan el serial como "?". Solo aceptarlos si
+            // NO hay ningún dispositivo con serial real (evita confundir con otro equipo).
+            if (devices.Count > 0 && devices.All(d => d == "?"))
                 return true;
         }
         return false;
@@ -837,8 +895,21 @@ namespace PCAndroidRooter.Services;
             return false;
         }
 
-        var result = ExecuteFastboot($"-s {serial} flash boot \"{bootImgPath}\"", timeoutMs: 120000);
+        var target = ResolveFastbootTarget(serial);
+        var result = ExecuteFastboot($"-s {target} flash boot \"{bootImgPath}\"", timeoutMs: 120000);
         return result.Success;
+    }
+
+    /// <summary>
+    /// Devuelve el serial a usar con fastboot -s. Si el bootloader reporta "?"
+    /// (algunos modelos) y es el único dispositivo, usa "?"; si no, el serial ADB.
+    /// </summary>
+    public string ResolveFastbootTarget(string serial)
+    {
+        var fbDevices = GetFastbootDevices();
+        if (fbDevices.Contains(serial)) return serial;
+        if (fbDevices.Count > 0 && fbDevices.All(d => d == "?")) return "?";
+        return serial;
     }
 
     public bool CheckAdbHealthy()

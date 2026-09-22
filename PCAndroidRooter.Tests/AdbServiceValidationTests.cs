@@ -16,9 +16,26 @@ public class AdbServiceValidationTests
     [InlineData("serial$(whoami)", false)]
     [InlineData("serial`id`", false)]
     [InlineData("a b", false)]
+    [InlineData("..", false)]
+    [InlineData("a..b", false)]
+    [InlineData("../evil", false)]
+    [InlineData("serial\0evil", false)]
     public void IsValidSerial_AcceptsOnlySafeChars(string serial, bool expected)
     {
         Assert.Equal(expected, AdbService.IsValidSerial(serial));
+    }
+
+    [Theory]
+    [InlineData("1A2B3C:4.0", "1A2B3C_4.0")]
+    [InlineData("emulator-5554", "emulator-5554")]
+    [InlineData("..", "unknown")]
+    [InlineData("../evil", "unknown")]
+    [InlineData("", "unknown")]
+    [InlineData("   ", "unknown")]
+    [InlineData("serial\\with\\slashes", "serial_with_slashes")]
+    public void SanitizeSerialForPath_ProducesSafeDirectoryNames(string serial, string expected)
+    {
+        Assert.Equal(expected, AdbService.SanitizeSerialForPath(serial));
     }
 
     [Theory]

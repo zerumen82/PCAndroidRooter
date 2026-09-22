@@ -45,7 +45,10 @@ public partial class RootMethod : ObservableObject
         set
         {
             if (SetProperty(ref _status, value))
+            {
                 OnPropertyChanged(nameof(StatusColor));
+                OnPropertyChanged(nameof(StatusText));
+            }
         }
     }
 

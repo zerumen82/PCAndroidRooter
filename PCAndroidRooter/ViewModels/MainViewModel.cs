@@ -269,14 +269,24 @@ public partial class MainViewModel : ObservableObject
 
     private void OnDevicesUpdated(List<string> devices)
     {
-        DeviceList.Clear();
-        foreach (var d in devices)
-            DeviceList.Add(d);
+        var previousSerial = SelectedSerial;
+
+        // Reconstruir solo si la membresía cambió — Clear() a secas resetea la
+        // selección del ComboBox aunque el mismo serial siga conectado.
+        var membershipChanged = devices.Count != DeviceList.Count ||
+                                devices.Any(d => !DeviceList.Contains(d));
+        if (membershipChanged)
+        {
+            DeviceList.Clear();
+            foreach (var d in devices)
+                DeviceList.Add(d);
+        }
 
         IsDeviceConnected = devices.Count > 0;
 
         if (devices.Count > 0 && !devices.Contains(SelectedSerial))
         {
+            // El setter OnSelectedSerialChanged lanza la carga de info (una sola vez)
             SelectedSerial = devices[0];
         }
 
@@ -287,7 +297,9 @@ public partial class MainViewModel : ObservableObject
         if (devices.Count > 0)
         {
             StatusText = "Dispositivo detectado. Cargando información...";
-            _ = LoadDeviceInfoAsync(SelectedSerial);
+            // Si la selección cambió arriba, el setter ya cargó; no duplicar la carga.
+            if (SelectedSerial == previousSerial)
+                _ = LoadDeviceInfoAsync(SelectedSerial);
         }
         else
         {
@@ -522,6 +534,12 @@ public partial class MainViewModel : ObservableObject
                 AppendLog("  ✅ ¡ROOT COMPLETADO CON ÉXITO!");
                 AppendLog("═══════════════════════════════════════════");
             }
+            else if (status == RootMethodStatus.WaitingDevice)
+            {
+                AppendLog("");
+                AppendLog("Flujo manual pendiente — sigue las instrucciones de la consola");
+                AppendLog("y vuelve a ejecutar 'One-Click Root' cuando el dispositivo esté listo.");
+            }
             else
             {
                 AppendLog("");
@@ -652,7 +670,12 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void ClearLog()
     {
-        LogText = string.Empty;
+        lock (_logLock)
+        {
+            _logBuilder.Clear();
+            _logLineCount = 0;
+            LogText = string.Empty;
+        }
     }
 
     [RelayCommand]
