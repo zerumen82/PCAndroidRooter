@@ -28,6 +28,11 @@ namespace PCAndroidRooter.Services;
         RegexOptions.Compiled);
     // Allowlist regex for package names
     private static readonly Regex ValidPackageNameRegex = new(@"^[a-zA-Z0-9._\-]+$", RegexOptions.Compiled);
+    // Allowlist regex for general remote file paths (backup/restore): absolute, no shell metacharacters
+    // Incluye '~' porque las rutas APK usan /data/app/~~xxxx==/pkg-yy==/base.apk
+    private static readonly Regex ValidRemoteFilePathRegex = new(
+        @"^/[A-Za-z0-9._\-=/+~ ]+$",
+        RegexOptions.Compiled);
 
     /// <summary>
     /// Valida que un serial number sea seguro para usar en comandos ADB.
@@ -44,6 +49,18 @@ namespace PCAndroidRooter.Services;
         !path.Contains("..", StringComparison.Ordinal) &&
         !path.Contains('\0') &&
         (ValidBlockPathRegex.IsMatch(path) || path.StartsWith("/data/local/tmp/", StringComparison.Ordinal));
+
+    /// <summary>
+    /// Valida una ruta remota absoluta para adb pull/push (backup/restore).
+    /// Permite /data/app, /sdcard, /dev/block, etc. Rechaza path traversal,
+    /// bytes nulos y metacaracteres de shell (; $ ` | & etc).
+    /// </summary>
+    public static bool IsValidRemoteFilePath(string path) =>
+        !string.IsNullOrWhiteSpace(path) &&
+        !path.Contains("..", StringComparison.Ordinal) &&
+        !path.Contains('\0') &&
+        path.StartsWith("/", StringComparison.Ordinal) &&
+        ValidRemoteFilePathRegex.IsMatch(path);
 
     /// <summary>
     /// Valida que un nombre de paquete Android sea seguro para usar en comandos shell.
@@ -705,26 +722,26 @@ namespace PCAndroidRooter.Services;
         return false;
     }
 
-    public AdbCommandResult PushFile(string serial, string localPath, string remotePath, int timeoutMs = 15000)
+    public AdbCommandResult PushFile(string serial, string localPath, string remotePath, int timeoutMs = 120000)
     {
         GuardValidSerial(serial);
-        if (!IsValidBlockPath(remotePath))
+        if (!IsValidRemoteFilePath(remotePath))
         {
             OutputReceived?.Invoke($"ERROR: Path remoto inválido: {remotePath}");
             return new AdbCommandResult { Success = false, Error = "Path remoto no permitido" };
         }
-        return ExecuteAdb($"-s {serial} push \"{localPath}\" {remotePath}", timeoutMs: timeoutMs);
+        return ExecuteAdb($"-s {serial} push \"{localPath}\" \"{remotePath}\"", timeoutMs: timeoutMs);
     }
 
-    public AdbCommandResult PullFile(string serial, string remotePath, string localPath, int timeoutMs = 15000)
+    public AdbCommandResult PullFile(string serial, string remotePath, string localPath, int timeoutMs = 120000)
     {
         GuardValidSerial(serial);
-        if (!IsValidBlockPath(remotePath))
+        if (!IsValidRemoteFilePath(remotePath))
         {
             OutputReceived?.Invoke($"ERROR: Path remoto inválido: {remotePath}");
             return new AdbCommandResult { Success = false, Error = "Path remoto no permitido" };
         }
-        return ExecuteAdb($"-s {serial} pull {remotePath} \"{localPath}\"", timeoutMs: timeoutMs);
+        return ExecuteAdb($"-s {serial} pull \"{remotePath}\" \"{localPath}\"", timeoutMs: timeoutMs);
     }
 
     public AdbCommandResult Shell(string serial, string command, int timeoutMs = 15000, CancellationToken ct = default)
@@ -879,10 +896,76 @@ namespace PCAndroidRooter.Services;
 
     public AdbCommandResult CheckBootloaderUnlock(string serial)
     {
-        var result = ExecuteFastboot($"-s {serial} oem device-info 2>/dev/null", timeoutMs: 30000);
-        if (!result.Success)
-            result = ExecuteFastboot($"-s {serial} getvar unlocked 2>/dev/null", timeoutMs: 30000);
+        // 1) Si el dispositivo está en Android (ADB): props estándar de estado.
+        //    Antes solo se consultaba fastboot → con el device en ADB siempre daba "bloqueado".
+        var adbDevices = GetConnectedDevices();
+        if (adbDevices.Contains(serial))
+        {
+            var state = ExecuteAdb($"-s {serial} shell getprop ro.boot.vbmeta.device_state", timeoutMs: 8000);
+            var stateVal = state.Success ? state.Output.Trim() : "";
+            if (stateVal.Equals("unlocked", StringComparison.OrdinalIgnoreCase))
+                return new AdbCommandResult { Success = true, Output = "unlocked: yes (adb ro.boot.vbmeta.device_state=unlocked)" };
+            if (stateVal.Equals("locked", StringComparison.OrdinalIgnoreCase))
+                return new AdbCommandResult { Success = true, Output = "unlocked: no (adb ro.boot.vbmeta.device_state=locked)" };
+
+            var flashLocked = ExecuteAdb($"-s {serial} shell getprop ro.boot.flash.locked", timeoutMs: 8000);
+            var flVal = flashLocked.Success ? flashLocked.Output.Trim() : "";
+            if (flVal == "0")
+                return new AdbCommandResult { Success = true, Output = "unlocked: yes (adb ro.boot.flash.locked=0)" };
+            if (flVal == "1")
+                return new AdbCommandResult { Success = true, Output = "unlocked: no (adb ro.boot.flash.locked=1)" };
+
+            var vbs = ExecuteAdb($"-s {serial} shell getprop ro.boot.verifiedbootstate", timeoutMs: 8000);
+            var vbsVal = vbs.Success ? vbs.Output.Trim() : "";
+            if (vbsVal.Equals("orange", StringComparison.OrdinalIgnoreCase))
+                return new AdbCommandResult { Success = true, Output = "unlocked: yes (adb ro.boot.verifiedbootstate=orange)" };
+            if (vbsVal.Equals("green", StringComparison.OrdinalIgnoreCase))
+                return new AdbCommandResult { Success = true, Output = "unlocked: no (adb ro.boot.verifiedbootstate=green)" };
+
+            // Device presente en ADB pero sin props diagnósticas → no intentar fastboot (bloquearía 60s).
+            return new AdbCommandResult { Success = true, Output = "unlocked: unknown (sin props de bootloader)" };
+        }
+
+        // 2) El dispositivo está en fastboot (u otro modo).
+        //    Sin '2>/dev/null': fastboot no es un shell y ese token rompe/ignora el comando.
+        var result = ExecuteFastboot($"-s {serial} oem device-info", timeoutMs: 30000);
+        if (!result.Success || string.IsNullOrWhiteSpace(result.Output))
+            result = ExecuteFastboot($"-s {serial} getvar unlocked", timeoutMs: 30000);
+
+        // fastboot escribe getvar/oem info en stderr en muchas versiones → combinar para el caller.
+        var combined = $"{result.Output}\n{result.Error}".Trim();
+        if (!string.IsNullOrWhiteSpace(combined))
+            result.Output = combined;
         return result;
+    }
+
+    /// <summary>
+    /// Interpreta la salida de CheckBootloaderUnlock (ADB o fastboot).
+    /// Devuelve null si el estado es desconocido.
+    /// </summary>
+    public static bool? ParseBootloaderUnlocked(string? output)
+    {
+        if (string.IsNullOrWhiteSpace(output)) return null;
+        var o = output.ToLowerInvariant();
+
+        if (o.Contains("unlocked: yes") || o.Contains("unlocked: true") ||
+            o.Contains("device unlocked: true") || o.Contains("device unlocked: yes") ||
+            o.Contains("already unlocked") ||
+            o.Contains("device_state=unlocked") ||
+            o.Contains("verifiedbootstate=orange") ||
+            o.Contains("flash.locked=0") ||
+            (o.Contains("unlocked!") && !o.Contains("not unlocked")))
+            return true;
+
+        if (o.Contains("unlocked: no") || o.Contains("unlocked: false") ||
+            o.Contains("device unlocked: false") || o.Contains("device unlocked: no") ||
+            o.Contains("device_state=locked") ||
+            o.Contains("verifiedbootstate=green") ||
+            o.Contains("flash.locked=1") ||
+            o.Contains("locked: yes"))
+            return false;
+
+        return null;
     }
 
     public AdbCommandResult InstallApk(string serial, string apkPath)

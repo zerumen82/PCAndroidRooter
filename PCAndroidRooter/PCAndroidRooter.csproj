@@ -22,4 +22,9 @@
     <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Necesario para pack://application:,,,/Resources/... en XAML (Image Source, etc.) -->
+    <Resource Include="Resources\android_capsule_icon.ico" />
+  </ItemGroup>
+
 </Project>

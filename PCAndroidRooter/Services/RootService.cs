@@ -214,16 +214,23 @@ case RootMethodType.CustomRecovery:
         if (activeSlot != null)
         {
             LogOk($"Sistema A/B detectado. Slot activo: {activeSlot}");
-            // Ajustar path de partición según slot activo
-            if (!bootPart.Path.EndsWith(activeSlot) && !bootPart.Path.Contains("bootdevice"))
+            // Reemplazar el sufijo _a/_b existente (antes concatenaba → boot_a_b inexistente).
+            var basePath = bootPart.Path;
+            if (basePath.EndsWith("_a", StringComparison.Ordinal) || basePath.EndsWith("_b", StringComparison.Ordinal))
+                basePath = basePath[..^2];
+            if (!basePath.EndsWith(activeSlot, StringComparison.Ordinal))
             {
-                var slotPath = bootPart.Path + activeSlot;
+                var slotPath = basePath + activeSlot;
                 var slotCheck = _adbService.Shell(serial, $"ls -l {slotPath} 2>/dev/null");
                 if (slotCheck.Success && !slotCheck.Output.Contains("No such file"))
                 {
                     LogOk($"Usando partición del slot activo: {slotPath}");
                     bootPart.Path = slotPath;
                     bootPart.BlockDevice = slotPath;
+                }
+                else
+                {
+                    LogWarning($"Partición del slot activo no encontrada ({slotPath}); se mantiene: {bootPart.Path}");
                 }
             }
         }
@@ -372,6 +379,9 @@ case RootMethodType.CustomRecovery:
         // Desempaquetar boot.img
         Log("  [7.1] Desempaquetando boot.img...");
         var cleanupCmd = "rm -rf /data/local/tmp/magisk /data/local/tmp/boot_to_patch.img /data/local/tmp/ramdisk.cpio /data/local/tmp/new-boot.img /data/local/tmp/boot_to_patch.img.bak /data/local/tmp/boot_to_patch.img_tmp";
+        // SIEMPRE limpiar antes del unpack: elimina new-boot.img stale de runs anteriores
+        // (si no, un repack fallido podría leer la imagen vieja y flashear basura → brick).
+        _adbService.Shell(serial, cleanupCmd, timeoutMs: 15000, ct: ct);
         var unpackResult = _adbService.Shell(serial, $"cd /data/local/tmp && {magiskBootBin} unpack boot_to_patch.img 2>&1", timeoutMs: 60000, ct: ct);
         if (!unpackResult.Success)
         {
@@ -433,21 +443,42 @@ case RootMethodType.CustomRecovery:
             }
         }
 
-        // Verificar que magisk fue inyectado
-        var verifyPatch = _adbService.Shell(serial,
-            $"{magiskBootBin} cpio ramdisk.cpio 'exists overlay.d/sbin/magisk' 2>&1", ct: ct);
-        var verifyPatch2 = _adbService.Shell(serial,
-            $"{magiskBootBin} cpio ramdisk.cpio 'exists sbin/magisk' 2>&1", ct: ct);
-
-        if ((!verifyPatch.Success || !verifyPatch.Output.Contains("1")) &&
-            (!verifyPatch2.Success || !verifyPatch2.Output.Contains("1")))
+        // Verificar que magisk fue inyectado (extracción positiva = ground truth)
+        var injectionVerified = false;
+        long injectedSize = 0;
+        _adbService.Shell(serial, "rm -f /data/local/tmp/_verify_magisk", ct: ct);
+        foreach (var entry in new[] { "overlay.d/sbin/magisk", "sbin/magisk" })
         {
-            LogWarning("No se pudo verificar que Magisk fue inyectado correctamente.");
-            Log("  El parche puede haber fallado silenciosamente.");
+            _adbService.Shell(serial,
+                $"cd /data/local/tmp && {magiskBootBin} cpio ramdisk.cpio 'extract {entry} _verify_magisk' 2>&1", ct: ct);
+            var vSize = _adbService.Shell(serial, "wc -c < /data/local/tmp/_verify_magisk 2>/dev/null", ct: ct);
+            if (long.TryParse(vSize.Output.Trim(), out injectedSize) && injectedSize > 10000)
+            {
+                injectionVerified = true;
+                break;
+            }
+        }
+        _adbService.Shell(serial, "rm -f /data/local/tmp/_verify_magisk", ct: ct);
+
+        if (injectionVerified)
+        {
+            LogOk($"  Magisk inyectado y verificado en ramdisk ({injectedSize} bytes).");
         }
         else
         {
-            LogOk("  Magisk inyectado correctamente en ramdisk.");
+            // Fallback: comprobar 'exists' de magiskboot
+            var verifyPatch = _adbService.Shell(serial,
+                $"{magiskBootBin} cpio ramdisk.cpio 'exists overlay.d/sbin/magisk' 2>&1", ct: ct);
+            var verifyPatch2 = _adbService.Shell(serial,
+                $"{magiskBootBin} cpio ramdisk.cpio 'exists sbin/magisk' 2>&1", ct: ct);
+            injectionVerified =
+                (verifyPatch.Success && (verifyPatch.Output.Contains("1") || verifyPatch.Output.Contains("true"))) ||
+                (verifyPatch2.Success && (verifyPatch2.Output.Contains("1") || verifyPatch2.Output.Contains("true")));
+
+            if (injectionVerified)
+                LogOk("  Magisk inyectado en ramdisk (verificado vía exists).");
+            else
+                LogWarning("  No se pudo verificar la inyección de Magisk en el ramdisk.");
         }
         ct.ThrowIfCancellationRequested();
 
@@ -484,7 +515,9 @@ case RootMethodType.CustomRecovery:
         var patchedImgLocal = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
             $"magisk_patched_{deviceInfo.Model}_{DateTime.Now:yyyyMMdd_HHmmss}.img");
 
-        var remotePatchedPaths = new[] { "/data/local/tmp/new-boot.img", "/data/local/tmp/boot_to_patch.img" };
+        // Solo new-boot.img: boot_to_patch.img es el ORIGINAL SIN PARCHAR —
+        // usarlo como fallback arriesga flashear/restaurar un boot sin Magisk.
+        var remotePatchedPaths = new[] { "/data/local/tmp/new-boot.img" };
         bool pulled = false;
         foreach (var remotePath in remotePatchedPaths)
         {
@@ -529,10 +562,27 @@ case RootMethodType.CustomRecovery:
 
         LogOk($"boot.img parcheado: VÁLIDO ({patchedValidation.FileSize / 1024 / 1024} MB)");
         LogOk($"  SHA256: {patchedValidation.Sha256?[..16]}...");
+
+        // Gate combinado anti-brick: NO flashear si ninguna señal confirma Magisk.
+        // (La inyección verificada en el dispositivo y las firmas en el binario son independientes:
+        //  si AMBAS fallan, el parche no se aplicó y flasheararía un boot sin root.)
         if (patchedValidation.ContainsMagisk)
+        {
             LogOk("  Firmas Magisk detectadas en el parche.");
+        }
+        else if (injectionVerified)
+        {
+            LogWarning("  Firmas Magisk no visibles en el binario (ramdisk comprimido), pero la inyección se verificó en el dispositivo.");
+        }
         else
-            LogWarning("  No se detectaron firmas Magisk (puede ser normal en algunas versiones).");
+        {
+            LogError("No hay evidencia de Magisk en el boot parcheado (inyección sin verificar y sin firmas).");
+            Log("  El parche falló. NO se flasheará este boot.img.");
+            Log("  El archivo original está respaldado en: " + bootImgBackup);
+            _adbService.Shell(serial, cleanupCmd, ct: ct);
+            _adbService.RestartAdb();
+            return RootMethodStatus.Failed;
+        }
         ct.ThrowIfCancellationRequested();
 
         // ════════════════════════════════════════════════════
@@ -942,7 +992,27 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             ct.ThrowIfCancellationRequested();
             await BackupContactsSmsAsync(serial, backupDir, ct);
 
-            Log($"\n✅ Backup completado en: {backupDir}");
+            // Gate: NO desbloquear (wipe) sin un backup con contenido real.
+            // Antes, los pulls fallaban en silencio por allowlist y se reportaba éxito con 0 archivos.
+            int backupFileCount;
+            try
+            {
+                backupFileCount = Directory.GetFiles(backupDir, "*", SearchOption.AllDirectories).Length;
+            }
+            catch
+            {
+                backupFileCount = 0;
+            }
+
+            if (backupFileCount == 0)
+            {
+                LogError("❌ Backup vacío — se CANCELA el desbloqueo para evitar pérdida de datos.");
+                Log("  Verifica la conexión ADB (depuración USB) y reintenta.");
+                Log("  Opcional: crea un backup manual antes de continuar.");
+                return RootMethodStatus.Failed;
+            }
+
+            Log($"\n✅ Backup completado en: {backupDir} ({backupFileCount} archivos)");
             Log("Guarda esta carpeta en un lugar seguro antes de continuar.");
         }
 
@@ -1029,7 +1099,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         Log("\nConsultando estado actual del bootloader...");
         var blInfo = _adbService.CheckBootloaderUnlock(serial);
         Log($"  {blInfo.Output.Trim()}");
-        if (blInfo.Output.Contains("unlocked: yes") || blInfo.Output.Contains("yes"))
+        if (AdbService.ParseBootloaderUnlocked(blInfo.Output) == true)
         {
             Log("\n✅ El bootloader YA ESTÁ DESBLOQUEADO.");
             _adbService.FastbootReboot(serial);
@@ -1447,6 +1517,7 @@ public async IAsyncEnumerable<string> RestoreBackupAsync(string serial, string b
 
          // Restore apps
          var appsDir = Path.Combine(backupDir, "apps");
+         int apkOk = 0, apkFail = 0;
          if (Directory.Exists(appsDir))
          {
              Log("\n[1/3] Restaurando apps...");
@@ -1472,6 +1543,7 @@ public async IAsyncEnumerable<string> RestoreBackupAsync(string serial, string b
                              Log($"      Obtenido: {currentHash[..16]}...");
                              Log($"      El APK puede estar corrupto o haber sido modificado.");
                              Log($"      Saltando instalación por seguridad.");
+                             apkFail++;
                              yield return $"✗ {apkName} omitido (hash no coincide)";
                              continue;
                          }
@@ -1486,11 +1558,13 @@ public async IAsyncEnumerable<string> RestoreBackupAsync(string serial, string b
                  var result = _adbService.InstallApk(serial, apk);
                  if (result.Success)
                  {
+                     apkOk++;
                      Log("    ✅ Instalada");
                      yield return $"✓ {apkName} instalada";
                  }
                  else
                  {
+                     apkFail++;
                      Log($"    ❌ Error: {result.Error}");
                      yield return $"✗ Error instalando {apkName}: {result.Error}";
                  }
@@ -1500,25 +1574,35 @@ public async IAsyncEnumerable<string> RestoreBackupAsync(string serial, string b
          // Restore documents/media
          var mediaDir = Path.Combine(backupDir, "media");
          var docsDir = Path.Combine(backupDir, "documents");
-         
+         int pushOk = 0, pushFail = 0;
+
          if (Directory.Exists(mediaDir) || Directory.Exists(docsDir))
          {
              Log("\n[2/3] Restaurando archivos...");
              yield return "Restaurando archivos multimedia y documentos...";
              var deviceStorage = "/sdcard/Download/PCAndroidRooter_Restored";
              _adbService.Shell(serial, $"mkdir -p {deviceStorage}");
-             
+
              var allFiles = Enumerable.Empty<string>();
              if (Directory.Exists(mediaDir)) allFiles = allFiles.Concat(Directory.GetFiles(mediaDir));
              if (Directory.Exists(docsDir)) allFiles = allFiles.Concat(Directory.GetFiles(docsDir));
-             
+
              foreach (var file in allFiles)
              {
                  ct.ThrowIfCancellationRequested();
-                 _adbService.PushFile(serial, file, $"{deviceStorage}/{Path.GetFileName(file)}");
+                 var push = _adbService.PushFile(serial, file, $"{deviceStorage}/{Path.GetFileName(file)}");
+                 if (push.Success)
+                 {
+                     pushOk++;
+                 }
+                 else
+                 {
+                     pushFail++;
+                     Log($"    ❌ No se pudo restaurar: {Path.GetFileName(file)} ({push.Error})");
+                 }
              }
-             Log($"  Archivos guardados en: {deviceStorage}");
-             yield return $"Archivos guardados en: {deviceStorage}";
+             Log($"  Archivos restaurados: {pushOk}/{pushOk + pushFail}");
+             yield return $"Archivos restaurados: {pushOk}/{pushOk + pushFail} en {deviceStorage}";
          }
 
          // Restore contacts (requires special handling)
@@ -1531,10 +1615,20 @@ public async IAsyncEnumerable<string> RestoreBackupAsync(string serial, string b
              yield return "Contactos detectados - restaurar manualmente desde contacts.txt";
          }
 
-         Log("\n✅ Restauración completada");
-         Log("  Las apps instaladas aparecerán en la pantalla de inicio");
-         Log("  Los archivos están en /sdcard/Download/PCAndroidRooter_Restored");
-         yield return "✅ Restauración completada exitosamente";
+         if (pushFail > 0 || apkFail > 0)
+         {
+             var totalFail = pushFail + apkFail;
+             var totalOk = pushOk + apkOk;
+             Log($"\n⚠ Restauración INCOMPLETA: {totalOk} correctos, {totalFail} fallidos");
+             yield return $"⚠ Restauración incompleta: {totalOk} correctos, {totalFail} fallidos";
+         }
+         else
+         {
+             Log("\n✅ Restauración completada");
+             Log("  Las apps instaladas aparecerán en la pantalla de inicio");
+             Log("  Los archivos están en /sdcard/Download/PCAndroidRooter_Restored");
+             yield return "✅ Restauración completada exitosamente";
+         }
      }
 
     private async Task<RootMethodStatus> CustomRecoveryRootAsync(string serial, CancellationToken ct)
@@ -1561,7 +1655,7 @@ public async IAsyncEnumerable<string> RestoreBackupAsync(string serial, string b
         }
 
         var blCheck = _adbService.CheckBootloaderUnlock(serial);
-        if (!blCheck.Output.Contains("unlocked: yes") && !blCheck.Output.Contains("yes"))
+        if (AdbService.ParseBootloaderUnlocked(blCheck.Output) != true)
         {
             Log("ERROR: Bootloader debe estar desbloqueado para flashear recovery.");
             Log("Usa el método 'Desbloquear Bootloader' primero.");
@@ -1634,7 +1728,7 @@ public async IAsyncEnumerable<string> RestoreBackupAsync(string serial, string b
 
         Log("\nPASO 1: Verificando bootloader...");
         var blCheck = _adbService.CheckBootloaderUnlock(serial);
-        if (!blCheck.Output.Contains("unlocked: yes") && !blCheck.Output.Contains("yes"))
+        if (AdbService.ParseBootloaderUnlocked(blCheck.Output) != true)
         {
             Log("ERROR: Bootloader debe estar desbloqueado para KernelSU.");
             Log("Usa el método 'Desbloquear Bootloader' primero.");
@@ -1733,7 +1827,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         // ── FASE 3: Verificar bootloader ──
         Log("\n▸ FASE 3: Verificando estado del bootloader...");
         var blCheck = _adbService.CheckBootloaderUnlock(serial);
-        var bootloaderUnlocked = blCheck.Output.Contains("unlocked: yes") || blCheck.Output.Contains("yes");
+        var bootloaderUnlocked = AdbService.ParseBootloaderUnlocked(blCheck.Output) == true;
         string? backupResult = null;
 
         if (!bootloaderUnlocked)
@@ -1764,7 +1858,9 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             }
             else
             {
-                LogWarning("No se pudo crear backup completo, pero se continuará.");
+                LogError("No se pudo crear backup. Se CANCELA el desbloqueo para no perder datos.");
+                Log("  Habilita depuración USB y reintenta, o crea un backup manual.");
+                return RootMethodStatus.Failed;
             }
             ct.ThrowIfCancellationRequested();
 
@@ -1899,6 +1995,22 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             ct.ThrowIfCancellationRequested();
             await BackupContactsSmsAsync(serial, backupDir, ct);
 
+            // Gate: backup vacío = fallido (los callers NO deben proceder al wipe).
+            int fileCount;
+            try
+            {
+                fileCount = Directory.GetFiles(backupDir, "*", SearchOption.AllDirectories).Length;
+            }
+            catch
+            {
+                fileCount = 0;
+            }
+            if (fileCount == 0)
+            {
+                LogError("Backup vacío (0 archivos) — no se considera válido.");
+                return null;
+            }
+
             // Crear resumen JSON
             var summary = new
             {
@@ -1907,7 +2019,8 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
                 timestamp = DateTime.Now,
                 appsCount = apps.Count,
                 mediaCount = media.Count,
-                documentsCount = docs.Count
+                documentsCount = docs.Count,
+                totalFiles = fileCount
             };
             var summaryPath = Path.Combine(backupDir, "backup_summary.json");
             await File.WriteAllTextAsync(summaryPath,
@@ -1993,6 +2106,11 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         // Backup
         Log("▸ Creando backup antes del desbloqueo...");
         var backupDir = await CreateFullBackupAsync(serial, ct);
+        if (backupDir == null)
+        {
+            LogWarning("⚠ No se pudo crear backup automático.");
+            Log("  ANTES de desbloquear, copia tus datos manualmente (el wipe es permanente).");
+        }
 
         Log("");
         Log("═══════════════════════════════════════════");
@@ -2181,6 +2299,8 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             ? $"{remoteDir}/magiskboot" : $"{remoteDir}/magiskboot32";
 
         var unpackCmd = $"cd /data/local/tmp && {magiskBoot} unpack boot_to_patch.img 2>/dev/null";
+        // Limpiar restos de runs anteriores (new-boot.img stale podría superar el check de tamaño)
+        _adbService.Shell(serial, "rm -f /data/local/tmp/new-boot.img /data/local/tmp/ramdisk.cpio /data/local/tmp/boot_to_patch.img.bak");
         var unpackResult = _adbService.Shell(serial, unpackCmd);
         if (!unpackResult.Success)
         {
@@ -2398,21 +2518,41 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
 
         Log("\n[1/4] Backup de apps instaladas...");
         ct.ThrowIfCancellationRequested();
-        await BackupAppsAsync(serial, backupDir, ct);
+        var mtkApps = await BackupAppsAsync(serial, backupDir, ct);
+        Log($"  Apps respaldadas: {mtkApps.Count}");
 
         Log("\n[2/4] Backup de fotos/vídeos...");
         ct.ThrowIfCancellationRequested();
-        await BackupMediaAsync(serial, backupDir, ct);
+        var mtkMedia = await BackupMediaAsync(serial, backupDir, ct);
+        Log($"  Archivos multimedia: {mtkMedia.Count}");
 
         Log("\n[3/4] Backup de documentos...");
         ct.ThrowIfCancellationRequested();
-        await BackupDocumentsAsync(serial, backupDir, ct);
+        var mtkDocs = await BackupDocumentsAsync(serial, backupDir, ct);
+        Log($"  Documentos: {mtkDocs.Count}");
 
         Log("\n[4/4] Backup de contactos y SMS...");
         ct.ThrowIfCancellationRequested();
         await BackupContactsSmsAsync(serial, backupDir, ct);
 
-        LogOk($"Backup completado: {backupDir}");
+        // Gate: no proceder al unlock MTK (wipe) con backup vacío.
+        int mtkBackupFileCount;
+        try
+        {
+            mtkBackupFileCount = Directory.GetFiles(backupDir, "*", SearchOption.AllDirectories).Length;
+        }
+        catch
+        {
+            mtkBackupFileCount = 0;
+        }
+        if (mtkBackupFileCount == 0)
+        {
+            LogError("❌ Backup vacío — se CANCELA el MTK unlock para evitar pérdida de datos.");
+            Log("  Verifica la conexión ADB (depuración USB) y reintenta.");
+            return RootMethodStatus.Failed;
+        }
+
+        LogOk($"Backup completado: {backupDir} ({mtkBackupFileCount} archivos)");
 
         Log("\n=== FASE 2: Modo BROM ===");
         Log("1. APAGA el teléfono por completo.");

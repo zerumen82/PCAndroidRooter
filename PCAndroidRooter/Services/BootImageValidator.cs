@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace PCAndroidRooter.Services;
 
@@ -170,19 +171,10 @@ public static class BootImageValidator
                 return result;
             }
 
-            // Verificar si contiene evidencia de Magisk (buscamos strings conocidos)
+            // Verificar si contiene evidencia de Magisk (escaneo completo del archivo,
+            // en chunks con solapamiento — no solo el primer 1 MB)
             fs.Seek(0, SeekOrigin.Begin);
-            var content = new byte[Math.Min(fileInfo.Length, 1024 * 1024)]; // Leer primeros 1 MB
-            int totalRead = 0;
-            while (totalRead < content.Length)
-            {
-                int read = fs.Read(content, totalRead, content.Length - totalRead);
-                if (read == 0) break;
-                totalRead += read;
-            }
-
-            // Buscar firmas de Magisk en el binario
-            result.ContainsMagisk = ContainsMagiskSignature(content);
+            result.ContainsMagisk = ContainsMagiskSignatureInStream(fs);
         }
         catch (Exception ex)
         {
@@ -267,16 +259,30 @@ public static class BootImageValidator
                 return slot;
         }
 
-        // Verificar qué particiones existen
+        // Detectar slot activo via /proc/cmdline (fallback si ro.boot.slot_suffix está vacío)
+        var cmdline = shellExecutor("cat /proc/cmdline 2>/dev/null");
+        if (cmdline.Success && !string.IsNullOrWhiteSpace(cmdline.Output))
+        {
+            var m = Regex.Match(cmdline.Output, @"androidboot\.slot_suffix=(_[ab])\b");
+            if (m.Success)
+                return m.Groups[1].Value;
+            m = Regex.Match(cmdline.Output, @"androidboot\.slot=([ab])\b");
+            if (m.Success)
+                return "_" + m.Groups[1].Value;
+        }
+
+        // Verificar qué particiones existen (último recurso: si solo existe boot_a, es slot _a)
         var bootA = shellExecutor("ls /dev/block/by-name/boot_a 2>/dev/null");
         var bootB = shellExecutor("ls /dev/block/by-name/boot_b 2>/dev/null");
 
-        if (bootA.Success && !bootA.Output.Contains("No such file"))
+        if (bootA.Success && !bootA.Output.Contains("No such file") &&
+            !(bootB.Success && !bootB.Output.Contains("No such file")))
             return "_a";
-        if (bootB.Success && !bootB.Output.Contains("No such file"))
+        if (bootB.Success && !bootB.Output.Contains("No such file") &&
+            !(bootA.Success && !bootA.Output.Contains("No such file")))
             return "_b";
 
-        return null; // Sistema A/B no detectado o partición unique
+        return null; // Sistema A/B no detectado, dual-partición o partición unique
     }
 
     /// <summary>
@@ -307,20 +313,54 @@ public static class BootImageValidator
         return false;
     }
 
+    private static bool ContainsMagiskSignatureInStream(Stream stream)
+    {
+        var signatures = GetMagiskSignatures();
+        int maxSigLen = signatures.Max(s => s.Length);
+        var chunk = new byte[1024 * 1024];
+        var carry = new byte[maxSigLen - 1];
+        int carryLen = 0;
+
+        int read;
+        while ((read = stream.Read(chunk, 0, chunk.Length)) > 0)
+        {
+            byte[] data;
+            if (carryLen == 0)
+            {
+                data = new byte[read];
+                Array.Copy(chunk, data, read);
+            }
+            else
+            {
+                data = new byte[carryLen + read];
+                Array.Copy(carry, 0, data, 0, carryLen);
+                Array.Copy(chunk, 0, data, carryLen, read);
+            }
+
+            if (ContainsMagiskSignature(data))
+                return true;
+
+            carryLen = Math.Min(carry.Length, data.Length);
+            Array.Copy(data, data.Length - carryLen, carry, 0, carryLen);
+        }
+
+        return false;
+    }
+
+    private static byte[][] GetMagiskSignatures() => new[]
+    {
+        Encoding.ASCII.GetBytes("magisk"),
+        Encoding.ASCII.GetBytes("Magisk"),
+        Encoding.ASCII.GetBytes("sbin/magisk"),
+        Encoding.ASCII.GetBytes("overlay.d"),
+        Encoding.ASCII.GetBytes("magiskinit"),
+        new byte[] { 0x4D, 0x61, 0x67, 0x69, 0x73, 0x6B } // "Magisk" en hex
+    };
+
     private static bool ContainsMagiskSignature(byte[] data)
     {
         // Firmas conocidas de Magisk en boot.img parcheado
-        var signatures = new[]
-        {
-            Encoding.ASCII.GetBytes("magisk"),
-            Encoding.ASCII.GetBytes("Magisk"),
-            Encoding.ASCII.GetBytes("sbin/magisk"),
-            Encoding.ASCII.GetBytes("overlay.d"),
-            Encoding.ASCII.GetBytes("magiskinit"),
-            new byte[] { 0x4D, 0x61, 0x67, 0x69, 0x73, 0x6B } // "Magisk" en hex
-        };
-
-        foreach (var sig in signatures)
+        foreach (var sig in GetMagiskSignatures())
         {
             if (ContainsBytes(data, sig))
                 return true;
