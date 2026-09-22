@@ -19,7 +19,8 @@ public partial class MainViewModel : ObservableObject
     private readonly MagiskService _magiskService;
     private readonly DeviceDetectionService _detectionService;
     private readonly RootService _rootService;
-    private CancellationTokenSource? _rootCts;
+     private CancellationTokenSource? _rootCts;
+    private bool _detectionPausedForSamsungUnlock;
     private readonly StringBuilder _logBuilder = new();
     private const int MaxLogLines = 500;
     private int _logLineCount;
@@ -438,7 +439,10 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            var status = await _rootService.ExecuteMethodAsync(method, SelectedSerial, _rootCts.Token);
+            // Task.Run: saca el flujo de root (bloqueos sync de adb/fastboot) del hilo UI
+            var status = await Task.Run(
+                () => _rootService.ExecuteMethodAsync(method, SelectedSerial, _rootCts.Token),
+                _rootCts.Token);
             AppendLog($"Método '{method.Name}' finalizado con estado: {status}");
         }
         finally
@@ -446,6 +450,7 @@ public partial class MainViewModel : ObservableObject
             if (keepPausedSamsungUnlock)
             {
                 _detectionService.Pause();
+                _detectionPausedForSamsungUnlock = true;
                 AppendLog("Detección de dispositivos pausada — sigue las instrucciones para el desbloqueo manual en Download Mode.");
                 AppendLog("Cuando termines, pulsa 'Refresh' para reconectar el dispositivo.");
             }
@@ -505,7 +510,10 @@ public partial class MainViewModel : ObservableObject
             AppendLog("  Esto puede tardar varios minutos...");
             AppendLog("");
 
-            var status = await _rootService.ExecuteMethodAsync(oneClickMethod, SelectedSerial, _rootCts.Token);
+            // Task.Run: el flujo de root bloquea con adb/fastboot; no congelar la UI
+            var status = await Task.Run(
+                () => _rootService.ExecuteMethodAsync(oneClickMethod, SelectedSerial, _rootCts.Token),
+                _rootCts.Token);
 
             if (status == RootMethodStatus.Success)
             {
@@ -617,10 +625,11 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private void RestartAdb()
+    private async Task RestartAdbAsync()
     {
         AppendLog("Reiniciando servidor ADB...");
-        _adbService.RestartAdb();
+        // Asíncrono: la versión síncrona hace Task.Delay(500).Wait() y congela la UI
+        await _adbService.RestartAdbAsync();
         IsAdbReady = true;
         AppendLog("ADB reiniciado.");
         _ = LoadDeviceInfoAsync(SelectedSerial);
@@ -629,6 +638,13 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void RefreshDevice()
     {
+        // Reanudar detección si quedó pausada por el flujo manual de Samsung unlock
+        if (_detectionPausedForSamsungUnlock)
+        {
+            _detectionPausedForSamsungUnlock = false;
+            _detectionService.Resume();
+            AppendLog("Detección de dispositivos reanudada.");
+        }
         if (!string.IsNullOrEmpty(SelectedSerial))
             _ = LoadDeviceInfoAsync(SelectedSerial);
     }
@@ -668,6 +684,12 @@ public partial class MainViewModel : ObservableObject
              return;
          }
 
+         if (IsRooting)
+         {
+             AppendLog("[ERROR] Ya hay una operación en curso.");
+             return;
+         }
+
          IsRooting = true;
          _rootCts = new CancellationTokenSource();
          _detectionService.Pause();
@@ -675,24 +697,30 @@ public partial class MainViewModel : ObservableObject
          try
          {
              AppendLog($"Iniciando restauración desde: {BackupDirectory}");
-             await foreach (var status in _rootService.RestoreBackupAsync(SelectedSerial, BackupDirectory, _rootCts.Token))
-             {
-                 AppendLog(status);
-             }
-             AppendLog("Restauración completada exitosamente.");
-         }
-         catch (Exception ex)
-         {
-             AppendLog($"[ERROR] Error durante restauración: {ex.Message}");
-         }
-         finally
-         {
-             _detectionService.Resume();
-             IsRooting = false;
-             _rootCts?.Dispose();
-             _rootCts = null;
-         }
-     }
+             var backupDir = BackupDirectory;
+             var serial = SelectedSerial;
+             var token = _rootCts.Token;
+             // Task.Run: RestoreBackupAsync hace adb push/install sincrónicos
+              await Task.Run(async () =>
+              {
+                  await foreach (var status in _rootService.RestoreBackupAsync(serial, backupDir, token))
+                  {
+                      AppendLog(status);
+                  }
+              }, token);
+          }
+          catch (Exception ex)
+          {
+              AppendLog($"[ERROR] Error durante restauración: {ex.Message}");
+          }
+          finally
+          {
+              _detectionService.Resume();
+              IsRooting = false;
+              _rootCts?.Dispose();
+              _rootCts = null;
+          }
+      }
 
      [RelayCommand]
      private void BrowseBackupDirectory()
@@ -788,8 +816,10 @@ public partial class MainViewModel : ObservableObject
 
     public void Shutdown()
     {
+        // Cancelar la operación en curso; NO Dispose mientras esté en vuelo
+        // (Dispose invalida el token → ObjectDisposedException en el proceso activo).
+        // El proceso va a salir; el GC se encarga del CTS.
         _rootCts?.Cancel();
-        _rootCts?.Dispose();
         _detectionService.Stop();
         _detectionService.Dispose();
         _adbService.Dispose();

@@ -190,33 +190,67 @@ public class MagiskService
 
         var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Recopilar entradas por ABI para NO pisar binarios entre arquitecturas
+        // (antes el último entry del zip ganaba → x86 podía sobrescribir arm64).
+        var entries = new List<(string FileName, string Abi, ZipArchiveEntry Entry)>();
         foreach (var entry in archive.Entries)
         {
             var parts = entry.FullName.Split('/');
             if (parts.Length < 2) continue;
             var fileName = parts[^1];
             if (!wanted.Contains(fileName)) continue;
+            entries.Add((fileName, parts[1], entry));
+        }
 
+        // Prioridad de ABI: escribir en orden ASCENDENTE para que el genérico
+        // quede con la ABI de mayor prioridad (último en escribir gana):
+        //   arm64-v8a(3) > x86_64(2) > armeabi-v7a(1) > x86(0)
+        static int AbiPriority(string abi)
+        {
+            var a = abi.ToLowerInvariant();
+            if (a.Contains("arm64") || a == "aarch64") return 3;
+            if (a.Contains("x86_64")) return 2;
+            if (a.Contains("armeabi") || a.Contains("armv7") || a == "arm") return 1;
+            if (a.Contains("x86")) return 0;
+            return 0;
+        }
+
+        static bool Is64BitAbi(string abi)
+        {
+            var a = abi.ToLowerInvariant();
+            return a.Contains("64");
+        }
+
+        foreach (var (fileName, abiDir, entry) in entries.OrderBy(e => AbiPriority(e.Abi)))
+        {
             // extraer 'lib' + '.so'  →  nombre base
             var baseName = fileName.AsSpan(3, fileName.Length - 6).ToString();
 
-            if (baseName is "magiskboot")
+            if (baseName is "magiskboot" or "magiskinit")
             {
-                // magiskboot no cambia de nombre por ABI (se usa en el dispositivo para todas)
-                WriteFile(entry, "magiskboot");
-                found.Add("magiskboot");
-            }
-            else if (baseName is "magiskinit")
-            {
-                WriteFile(entry, "magiskinit");
-                found.Add("magiskinit");
+                // Copia específica de la ABI (la selecciona RootService según el dispositivo)
+                WriteFile(entry, $"{baseName}-{abiDir}");
+                found.Add($"{baseName}-{abiDir}");
+
+                // Nombre genérico (fallback)
+                WriteFile(entry, baseName);
+                found.Add(baseName);
+
+                // magiskboot32: alias para ABI 32-bit (x86 primero, armeabi gana al escribir después)
+                if (baseName is "magiskboot" && !Is64BitAbi(abiDir))
+                {
+                    WriteFile(entry, "magiskboot32");
+                    found.Add("magiskboot32");
+                }
             }
             else if (baseName is "magisk")
             {
-                // libmagisk.so → magisk64 o magisk32 según la ABI del directorio
-                var abiDir = parts[1]; // "arm64-v8a", "armeabi-v7a", "x86_64", "x86"
-                var is64 = abiDir.Contains("64") || abiDir.Contains("arm64");
-                var destName = is64 ? "magisk64" : "magisk32";
+                // libmagisk.so → magisk64 o magisk32 según los bits de la ABI
+                var destName = Is64BitAbi(abiDir) ? "magisk64" : "magisk32";
+
+                WriteFile(entry, $"{destName}-{abiDir}");
+                found.Add($"{destName}-{abiDir}");
+
                 WriteFile(entry, destName);
                 found.Add(destName);
             }

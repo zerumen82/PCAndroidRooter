@@ -692,10 +692,17 @@ namespace PCAndroidRooter.Services;
             if (process == null) return false;
 
             using var outputFile = File.Create(outputPath);
-            await process.StandardOutput.BaseStream.CopyToAsync(outputFile, 81920, ct);
+            // Leer stdout y stderr EN PARALELO: si stderr llena su buffer (4KB)
+            // mientras leemos solo stdout, el proceso se bloquea y el pull cuelga.
+            var stdoutTask = process.StandardOutput.BaseStream.CopyToAsync(outputFile, 81920, ct);
+            var stderrTask = process.StandardError.ReadToEndAsync(ct);
+            await Task.WhenAll(stdoutTask, stderrTask);
+            if (!process.WaitForExit(120000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+            }
 
-            var error = await process.StandardError.ReadToEndAsync(ct);
-            process.WaitForExit(120000);
+            var error = stderrTask.Result;
 
             if (process.ExitCode == 0 && new FileInfo(outputPath).Length > 100000)
             {
@@ -768,10 +775,16 @@ namespace PCAndroidRooter.Services;
             if (process == null) return false;
 
             using var outputFile = File.Create(localPath);
-            await process.StandardOutput.BaseStream.CopyToAsync(outputFile, 81920, ct);
+            // Paralelo: evitar deadlock si stderr llena su buffer durante el pull
+            var stdoutTask = process.StandardOutput.BaseStream.CopyToAsync(outputFile, 81920, ct);
+            var stderrTask = process.StandardError.ReadToEndAsync(ct);
+            await Task.WhenAll(stdoutTask, stderrTask);
+            if (!process.WaitForExit(120000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+            }
 
-            var error = await process.StandardError.ReadToEndAsync(ct);
-            process.WaitForExit(120000);
+            var error = stderrTask.Result;
 
             if (process.ExitCode == 0 && new FileInfo(localPath).Length > 100000)
                 return true;

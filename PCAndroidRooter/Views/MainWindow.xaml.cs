@@ -74,6 +74,21 @@ public partial class MainWindow : Window
 
     private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
+        if (_viewModel.IsRooting)
+        {
+            var result = MessageBox.Show(
+                "Hay una operación de root/restauración en curso.\n\n" +
+                "Si sales ahora, el proceso se cancelará (el teléfono puede quedar en un estado intermedio).\n\n" +
+                "¿Salir de todos modos?",
+                "Operación en curso",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (result != MessageBoxResult.OK)
+            {
+                e.Cancel = true;
+                return;
+            }
+        }
         _viewModel.Shutdown();
     }
 }

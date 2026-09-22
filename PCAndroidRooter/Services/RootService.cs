@@ -118,13 +118,22 @@ case RootMethodType.CustomRecovery:
     private static readonly string[] MagiskBinaryFiles =
         { "magiskboot", "magiskboot32", "magisk64", "magisk32", "magiskinit" };
 
-    private int PushMagiskBinaries(string serial, CancellationToken ct)
+    private int PushMagiskBinaries(string serial, string deviceAbi, CancellationToken ct)
     {
         _adbService.Shell(serial, $"mkdir -p {RemoteMagiskDir}", ct: ct);
         _adbService.Shell(serial, $"rm -rf {RemoteMagiskDir}/*", ct: ct);
 
+        // Incluir copias específicas de la ABI del dispositivo
+        var files = new List<string>(MagiskBinaryFiles)
+        {
+            $"magiskboot-{deviceAbi}",
+            $"magiskinit-{deviceAbi}",
+            $"magisk64-{deviceAbi}",
+            $"magisk32-{deviceAbi}"
+        };
+
         var pushed = 0;
-        foreach (var file in MagiskBinaryFiles)
+        foreach (var file in files)
         {
             ct.ThrowIfCancellationRequested();
             var localPath = Path.Combine(_magiskService.MagiskDir, file);
@@ -139,10 +148,33 @@ case RootMethodType.CustomRecovery:
         return pushed;
     }
 
-    private string RemoteMagiskBootPath =>
-        File.Exists(Path.Combine(_magiskService.MagiskDir, "magiskboot"))
-            ? $"{RemoteMagiskDir}/magiskboot"
-            : $"{RemoteMagiskDir}/magiskboot32";
+    private string RemoteMagiskBootPath(string deviceAbi)
+    {
+        var dir = _magiskService.MagiskDir;
+        var is64 = deviceAbi.Contains("64", StringComparison.OrdinalIgnoreCase) ||
+                   deviceAbi.Contains("arm64", StringComparison.OrdinalIgnoreCase);
+
+        // 1) Copia específica de la ABI del dispositivo
+        if (File.Exists(Path.Combine(dir, $"magiskboot-{deviceAbi}")))
+            return $"{RemoteMagiskDir}/magiskboot-{deviceAbi}";
+
+        // 2) 32-bit → magiskboot32 (el genérico 'magiskboot' es arm64 por defecto)
+        if (!is64 && File.Exists(Path.Combine(dir, "magiskboot32")))
+            return $"{RemoteMagiskDir}/magiskboot32";
+
+        if (File.Exists(Path.Combine(dir, "magiskboot")))
+            return $"{RemoteMagiskDir}/magiskboot";
+
+        return $"{RemoteMagiskDir}/magiskboot32";
+    }
+
+    private string LocalMagiskBinPath(string remoteName, string deviceAbi)
+    {
+        // Preferir la copia específica de ABI si existe en local
+        if (File.Exists(Path.Combine(_magiskService.MagiskDir, $"{remoteName}-{deviceAbi}")))
+            return $"{remoteName}-{deviceAbi}";
+        return remoteName;
+    }
 
     private async Task<RootMethodStatus> MagiskRootAsync(string serial, CancellationToken ct)
     {
@@ -252,19 +284,30 @@ case RootMethodType.CustomRecovery:
             }
         }
 
-        // Verificar integridad de los binaries críticos
+        // Verificar integridad de los binaries críticos (preferir copia de la ABI del dispositivo)
+        var abiBootPath = Path.Combine(_magiskService.MagiskDir, $"magiskboot-{deviceInfo.Abi}");
         var magiskBootPath = Path.Combine(_magiskService.MagiskDir, "magiskboot");
         var magiskBoot32Path = Path.Combine(_magiskService.MagiskDir, "magiskboot32");
         var magiskInitPath = Path.Combine(_magiskService.MagiskDir, "magiskinit");
 
-        if (!File.Exists(magiskBootPath) && !File.Exists(magiskBoot32Path))
+        var is64Device = deviceInfo.Abi.Contains("64", StringComparison.OrdinalIgnoreCase) ||
+                          deviceInfo.Abi.Contains("arm64", StringComparison.OrdinalIgnoreCase);
+        if (!File.Exists(abiBootPath) && !File.Exists(magiskBootPath) && !File.Exists(magiskBoot32Path))
         {
             LogError("No se encontró magiskboot ni magiskboot32.");
             Log("  Los binaries de Magisk están corruptos o incompletos.");
             return RootMethodStatus.Failed;
         }
 
-        var activeMagiskBoot = File.Exists(magiskBootPath) ? magiskBootPath : magiskBoot32Path;
+        string activeMagiskBoot;
+        if (File.Exists(abiBootPath))
+            activeMagiskBoot = abiBootPath;
+        else if (is64Device && File.Exists(magiskBootPath))
+            activeMagiskBoot = magiskBootPath;
+        else if (!is64Device && File.Exists(magiskBoot32Path))
+            activeMagiskBoot = magiskBoot32Path;
+        else
+            activeMagiskBoot = File.Exists(magiskBootPath) ? magiskBootPath : magiskBoot32Path;
         var magiskBootInfo = new FileInfo(activeMagiskBoot);
         if (magiskBootInfo.Length < 1024) // Menos de 1 KB es sospechoso
         {
@@ -327,7 +370,7 @@ case RootMethodType.CustomRecovery:
         // ════════════════════════════════════════════════════
         Log("\nPASO 5: Preparando binaries de Magisk en el dispositivo...");
         var remoteDir = RemoteMagiskDir;
-        var pushed = PushMagiskBinaries(serial, ct);
+        var pushed = PushMagiskBinaries(serial, deviceInfo.Abi, ct);
 
         if (pushed == 0)
         {
@@ -337,8 +380,11 @@ case RootMethodType.CustomRecovery:
         }
         LogOk($"  {pushed} binaries subidos y permisos configurados.");
 
+        // Ruta remota del magiskboot correcto para la ABI del dispositivo
+        var magiskBootBin = RemoteMagiskBootPath(deviceInfo.Abi);
+
         // Verificar que magiskboot se ejecuta en el dispositivo
-        var magiskBootTest = _adbService.Shell(serial, $"{remoteDir}/magiskboot --help 2>&1 | head -1");
+        var magiskBootTest = _adbService.Shell(serial, $"{magiskBootBin} --help 2>&1 | head -1");
         if (!magiskBootTest.Success || string.IsNullOrWhiteSpace(magiskBootTest.Output))
         {
             // Intentar con magiskboot32
@@ -349,6 +395,7 @@ case RootMethodType.CustomRecovery:
             LogError("magiskboot no se ejecuta en el dispositivo.");
             Log("  El binary puede ser incompatible con la ABI del dispositivo.");
             Log($"  ABI del dispositivo: {deviceInfo.Abi}");
+            Log($"  Binario probado: {magiskBootBin}");
             Log("  Prueba a descargar Magisk manualmente desde:");
             Log("  https://github.com/topjohnwu/Magisk/releases");
             return RootMethodStatus.Failed;
@@ -374,7 +421,6 @@ case RootMethodType.CustomRecovery:
         // PASO 7: Parchear boot.img con Magisk
         // ════════════════════════════════════════════════════
         Log("\nPASO 7: Parcheando boot.img con Magisk...");
-        var magiskBootBin = RemoteMagiskBootPath;
 
         // Desempaquetar boot.img
         Log("  [7.1] Desempaquetando boot.img...");
@@ -411,10 +457,11 @@ case RootMethodType.CustomRecovery:
         LogOk("  ramdisk.cpio verificado.");
         ct.ThrowIfCancellationRequested();
 
-        // Inyectar Magisk en ramdisk
+        // Inyectar Magisk en ramdisk (usar copia de la ABI del dispositivo si existe)
         Log("  [7.2] Inyectando Magisk en ramdisk...");
-        var magiskBinPath = deviceInfo.Abi.Contains("64") ? $"{remoteDir}/magisk64" : $"{remoteDir}/magisk32";
-        var magiskInitPathRemote = $"{remoteDir}/magiskinit";
+        var magiskBinName = is64Device ? "magisk64" : "magisk32";
+        var magiskBinPath = $"{remoteDir}/{LocalMagiskBinPath(magiskBinName, deviceInfo.Abi)}";
+        var magiskInitPathRemote = $"{remoteDir}/{LocalMagiskBinPath("magiskinit", deviceInfo.Abi)}";
 
         // Método 1: Inyección completa via overlay.d
         var patchCmd = $"cd /data/local/tmp && " +
@@ -2275,7 +2322,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
 
         Log("\nPASO 4: Preparando binaries de Magisk en el dispositivo...");
         var remoteDir = RemoteMagiskDir;
-        var pushed = PushMagiskBinaries(serial, ct);
+        var pushed = PushMagiskBinaries(serial, deviceInfo.Abi, ct);
         if (pushed == 0)
         {
             LogWarning("No se pudieron subir todos los binaries de Magisk.");
@@ -2295,8 +2342,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         ct.ThrowIfCancellationRequested();
 
         Log("\nPASO 6: Parcheando boot.img con magiskboot...");
-        var magiskBoot = File.Exists(Path.Combine(_magiskService.MagiskDir, "magiskboot"))
-            ? $"{remoteDir}/magiskboot" : $"{remoteDir}/magiskboot32";
+        var magiskBoot = RemoteMagiskBootPath(deviceInfo.Abi);
 
         var unpackCmd = $"cd /data/local/tmp && {magiskBoot} unpack boot_to_patch.img 2>/dev/null";
         // Limpiar restos de runs anteriores (new-boot.img stale podría superar el check de tamaño)
@@ -2317,11 +2363,14 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         ct.ThrowIfCancellationRequested();
 
         Log("  Aplicando parche Magisk al ramdisk...");
-        var magiskBinPath = deviceInfo.Abi.Contains("64") ? $"{remoteDir}/magisk64" : $"{remoteDir}/magisk32";
+        var fastbootIs64 = deviceInfo.Abi.Contains("64", StringComparison.OrdinalIgnoreCase);
+        var magiskBinName = fastbootIs64 ? "magisk64" : "magisk32";
+        var magiskBinPath = $"{remoteDir}/{LocalMagiskBinPath(magiskBinName, deviceInfo.Abi)}";
+        var magiskInitRemote = $"{remoteDir}/{LocalMagiskBinPath("magiskinit", deviceInfo.Abi)}";
         var ramdiskPatchCmd = $"cd /data/local/tmp && {magiskBoot} cpio ramdisk.cpio 'mkdir 0750 overlay.d' " +
                               $"&& {magiskBoot} cpio ramdisk.cpio 'mkdir 0750 overlay.d/sbin' " +
                               $"&& {magiskBoot} cpio ramdisk.cpio 'add 0750 overlay.d/sbin/magisk {magiskBinPath}' " +
-                              $"&& {magiskBoot} cpio ramdisk.cpio 'add 0644 overlay.d/sbin/magiskinit {remoteDir}/magiskinit'";
+                              $"&& {magiskBoot} cpio ramdisk.cpio 'add 0644 overlay.d/sbin/magiskinit {magiskInitRemote}'";
 
         var patchResult = _adbService.Shell(serial, ramdiskPatchCmd);
         if (!patchResult.Success)
