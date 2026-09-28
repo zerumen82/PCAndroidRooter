@@ -230,20 +230,20 @@
                     <Border CornerRadius="12" Padding="20" Margin="0,0,0,16"
                             Background="{DynamicResource PrimaryHueMidBrush}">
                         <StackPanel HorizontalAlignment="Center">
-                            <TextBlock Text="¿Quieres root en tu teléfono?" FontSize="18" FontWeight="Bold"
+                            <TextBlock Text="Root sin borrar el teléfono" FontSize="18" FontWeight="Bold"
                                        Foreground="White" HorizontalAlignment="Center" Margin="0,0,0,4"/>
-                            <TextBlock Text="Pulsa un botón y lo hacemos todo automáticamente"
+                            <TextBlock Text="Solo si el bootloader ya está desbloqueado. Si no, no se toca nada."
                                        FontSize="13" Foreground="#E3F2FD" HorizontalAlignment="Center" Margin="0,0,0,10"/>
                             <!-- Safety badges -->
                             <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,14">
                                 <Border Background="#43A047" CornerRadius="4" Padding="8,3" Margin="0,0,8,0">
-                                    <TextBlock Text="✓ No perderás datos" FontSize="11" Foreground="White" FontWeight="SemiBold"/>
+                                    <TextBlock Text="✓ No formatea" FontSize="11" Foreground="White" FontWeight="SemiBold"/>
                                 </Border>
                                 <Border Background="#43A047" CornerRadius="4" Padding="8,3" Margin="0,0,8,0">
-                                    <TextBlock Text="✓ Backup automático" FontSize="11" Foreground="White" FontWeight="SemiBold"/>
+                                    <TextBlock Text="✓ No desbloquea" FontSize="11" Foreground="White" FontWeight="SemiBold"/>
                                 </Border>
                                 <Border Background="#43A047" CornerRadius="4" Padding="8,3">
-                                    <TextBlock Text="✓ Reversible" FontSize="11" Foreground="White" FontWeight="SemiBold"/>
+                                    <TextBlock Text="✓ Si está cerrado, se detiene" FontSize="11" Foreground="White" FontWeight="SemiBold"/>
                                 </Border>
                             </StackPanel>
                             <Button Command="{Binding OneClickRootCommand}"
@@ -258,9 +258,8 @@
                             <TextBlock Text="Conecta un teléfono por USB para comenzar"
                                        FontSize="13" Foreground="#B3FFFFFF" HorizontalAlignment="Center" Margin="0,8,0,0"
                                        Visibility="{Binding IsDeviceConnected, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}" />
-                            <!-- Warning about bootloader unlock -->
-                            <TextBlock Text="⚠ Si el bootloader está bloqueado, se borrará el contenido del teléfono"
-                                       FontSize="11" Foreground="#FFECB3" HorizontalAlignment="Center" Margin="0,10,0,0"
+                            <TextBlock Text="Desbloquear el bootloader sí borra todo, y no forma parte de este botón."
+                                       FontSize="11" Foreground="#FFECB3" HorizontalAlignment="Center" TextWrapping="Wrap" Margin="0,10,0,0"
                                        Visibility="{Binding IsDeviceConnected, Converter={StaticResource BoolToVis}}"/>
                         </StackPanel>
                     </Border>
@@ -376,6 +375,7 @@
                                             RelativeSource={RelativeSource AncestorType={x:Type ItemsControl}}}"
                                             CommandParameter="{Binding}"
                                             Content="EJECUTAR"
+                                            IsEnabled="{Binding IsAvailable}"
                                             Style="{StaticResource MaterialDesignFlatButton}"
                                             Background="{DynamicResource PrimaryHueMidBrush}"
                                             Foreground="White"

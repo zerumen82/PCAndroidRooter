@@ -37,6 +37,15 @@ public class RootService
 
     public async Task<RootMethodStatus> ExecuteMethodAsync(RootMethod method, string serial, CancellationToken ct)
     {
+        if (RootSafetyPolicy.IsFakeOrUnsupported(method.Type))
+        {
+            Log($"'{method.Name}' no está implementado.");
+            Log("  No se ha reiniciado ni modificado el teléfono.");
+            Log("  Para rootear sin borrar datos: bootloader ya desbloqueado + Magisk Patch.");
+            MethodStatusChanged?.Invoke(method.Type, RootMethodStatus.NotSupported);
+            return RootMethodStatus.NotSupported;
+        }
+
         MethodStatusChanged?.Invoke(method.Type, RootMethodStatus.Running);
 
         // Verificar que ADB responde antes de empezar
@@ -179,7 +188,7 @@ case RootMethodType.CustomRecovery:
     private async Task<RootMethodStatus> MagiskRootAsync(string serial, CancellationToken ct)
     {
         Log("╔═══════════════════════════════════════════╗");
-        Log("║   ROOT VÍA MAGISK PATCH (SEGURO)         ║");
+        Log("║   ROOT VÍA MAGISK (no borra tus datos)   ║");
         Log("╚═══════════════════════════════════════════╝");
 
         // ════════════════════════════════════════════════════
@@ -629,7 +638,23 @@ case RootMethodType.CustomRecovery:
         ct.ThrowIfCancellationRequested();
 
         // ════════════════════════════════════════════════════
-        // PASO 10: Verificar Samsung (no flashea automático)
+        // PASO 10: No reiniciar ni flashear si el bootloader no está confirmado.
+        // Desbloquearlo para poder flashear borraría todos los datos.
+        // ════════════════════════════════════════════════════
+        var blBeforeFlash = _adbService.CheckBootloaderUnlock(serial);
+        if (AdbService.ParseBootloaderUnlocked(blBeforeFlash.Output) != true)
+        {
+            LogError("Bootloader bloqueado o no confirmado. NO se reinicia ni se flashea.");
+            Log("  Con el bootloader cerrado no se puede rootear, y desbloquearlo BORRA los datos.");
+            Log("  El teléfono sigue en Android. No se ha borrado nada.");
+            Log($"  Boot original (por si lo necesitas): {bootImgBackup}");
+            Log($"  Boot parcheado, NO flasheado: {patchedImgLocal}");
+            _adbService.RestartAdb();
+            return RootMethodStatus.Failed;
+        }
+
+        // ════════════════════════════════════════════════════
+        // PASO 10b: Verificar Samsung (no flashea automático)
         // ════════════════════════════════════════════════════
         var manufacturer = deviceInfo.Manufacturer.ToLowerInvariant();
         if (manufacturer == "samsung")
@@ -1012,16 +1037,13 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         return true;
     }
 
-    private async Task<RootMethodStatus> UnlockBootloaderAsync(string serial, CancellationToken ct, bool skipBackup = false)
+    private async Task<RootMethodStatus> UnlockBootloaderAsync(string serial, CancellationToken ct)
     {
         Log("═══════════════════════════════════════════");
         Log("     DESBLOQUEO DE BOOTLOADER");
         Log("═══════════════════════════════════════════");
         Log("ADVERTENCIA: Esto borrará TODOS los datos del dispositivo.");
-        if (!skipBackup)
-            Log("Se realizará backup automático antes de continuar.");
-        else
-            Log("Backup ya realizado — se omite para evitar duplicados.");
+        Log("Se intenta un backup parcial antes. Si no copia nada, se cancela y no se reinicia.");
 
         var manufacturer = _adbService.ExecuteAdb($"-s {serial} shell getprop ro.product.manufacturer").Output.Trim().ToLowerInvariant();
         Log($" Fabricante detectado: {manufacturer}");
@@ -1064,16 +1086,15 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             Log("  Si prefieres hacerlo manual, cierra esta herramienta y sigue los pasos.\n");
         }
 
-        var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", AdbService.SanitizeSerialForPath(serial));
-        Directory.CreateDirectory(backupDir);
+        // Carpeta nueva: una reutilizada contaba archivos viejos como backup de hoy
+        // y autorizaba el formateo aunque este intento no hubiera copiado nada.
+        var backupDir = CreateFreshBackupDirectory(serial);
 
         Dictionary<string, string> apkResult = new();
         List<string> mediaResult = new();
         List<string> docsResult = new();
 
-        if (!skipBackup)
-        {
-            Log("\n=== FASE 1: Backup automático de datos del cliente ===");
+        Log("\n=== FASE 1: Backup automático de datos del cliente ===");
 
             Log("\n[1/4] Backup de apps (.apk) instaladas...");
             ct.ThrowIfCancellationRequested();
@@ -1094,29 +1115,24 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
             ct.ThrowIfCancellationRequested();
             await BackupContactsSmsAsync(serial, backupDir, ct);
 
-            // Gate: NO desbloquear (wipe) sin un backup con contenido real.
-            // Antes, los pulls fallaban en silencio por allowlist y se reportaba éxito con 0 archivos.
-            int backupFileCount;
-            try
+            // Gate: no formatear si este intento no copió apps, fotos o documentos.
+            // Un contacts.txt o archivos de un backup anterior no cuentan.
+            if (!RootSafetyPolicy.BackupHasUserFiles(apkResult.Count, mediaResult.Count, docsResult.Count))
             {
-                backupFileCount = Directory.GetFiles(backupDir, "*", SearchOption.AllDirectories).Length;
-            }
-            catch
-            {
-                backupFileCount = 0;
-            }
-
-            if (backupFileCount == 0)
-            {
-                LogError("❌ Backup vacío — se CANCELA el desbloqueo para evitar pérdida de datos.");
-                Log("  Verifica la conexión ADB (depuración USB) y reintenta.");
-                Log("  Opcional: crea un backup manual antes de continuar.");
+                LogError("❌ Backup sin apps, fotos ni documentos — se CANCELA el desbloqueo.");
+                Log("  No se reinicia el teléfono. Tus datos siguen intactos.");
+                Log("  El backup automático es parcial e incompleto; si quieres conservar");
+                Log("  los datos, cópialos tú al PC y no desbloquees el bootloader.");
                 return RootMethodStatus.Failed;
             }
 
-            Log($"\n✅ Backup completado en: {backupDir} ({backupFileCount} archivos)");
-            Log("Guarda esta carpeta en un lugar seguro antes de continuar.");
-        }
+            Log($"\n✅ Backup parcial en: {backupDir}");
+            Log($"  Apps (solo APK, sin sus datos): {apkResult.Count}");
+            Log($"  Fotos/vídeos (tope bajo): {mediaResult.Count}");
+            Log($"  Documentos (tope bajo): {docsResult.Count}");
+            LogWarning("ESTO NO ES UNA COPIA DEL TELÉFONO.");
+            LogWarning("No incluye datos de apps, cuentas, chats ni la mayoría de archivos.");
+            LogWarning("El desbloqueo va a BORRAR el teléfono igualmente.");
 
         // Cancelación durante el backup no debe llegar hasta aquí tragada:
         // abortar ANTES de la fase de wipe.
@@ -1273,18 +1289,9 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         Log("═══════════════════════════════════════════");
         Log("  Los datos del dispositivo fueron BORRADOS (factory reset).");
         Log("  Esto es normal — configúralo de nuevo como dispositivo nuevo.");
-        Log($"  El backup está disponible en: {backupDir}");
+        Log($"  El backup parcial está en: {backupDir}");
+        LogWarning("No recupera cuentas, chats ni datos de las apps.");
 
-        if (skipBackup)
-        {
-            // NO reescribir backup_summary.json con hashes vacíos (apkResult está
-            // vacío en skipBackup) — destruiría el resumen real del backup previo.
-            if (File.Exists(Path.Combine(backupDir, "backup_summary.json")))
-                Log("  Resumen del backup existente conservado (skipBackup).");
-        }
-        else
-        {
-        // Create backup summary file
         try
         {
             var summary = new
@@ -1321,7 +1328,6 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         {
             Log($"  Error al crear resumen: {ex.Message}");
         }
-        } // fin else (!skipBackup)
 
         Log("\nReiniciando dispositivo...");
         _adbService.FastbootReboot(serial);
@@ -1896,10 +1902,10 @@ public async IAsyncEnumerable<string> RestoreBackupAsync(string serial, string b
 private async Task<RootMethodStatus> OneClickRootAsync(string serial, CancellationToken ct)
     {
         Log("╔═══════════════════════════════════════════╗");
-        Log("║       ONE-CLICK ROOT (100% Automático)    ║");
+        Log("║     ROOT AUTOMÁTICO (sin borrar datos)    ║");
         Log("╚═══════════════════════════════════════════╝");
-        Log("Este proceso detecta tu dispositivo y ejecuta");
-        Log("el método de root más adecuado automáticamente.");
+        Log("No desbloquea el bootloader. Si está cerrado, se detiene");
+        Log("y el teléfono queda como estaba.");
         Log("");
 
         // ── FASE 0: Verificar ADB ──
@@ -1931,12 +1937,9 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             return RootMethodStatus.Failed;
         }
 
-        var manufacturer = deviceInfo.Manufacturer.ToLowerInvariant();
         var model = deviceInfo.Model;
         var androidVersion = deviceInfo.AndroidVersion;
         var abi = deviceInfo.Abi;
-        var isSamsung = manufacturer == "samsung";
-        var isMediatek = deviceInfo.IsMediaTek;
 
         LogOk($"Dispositivo: {deviceInfo.Manufacturer} {model}");
         LogOk($"Android: {androidVersion} | ABI: {abi}");
@@ -1962,98 +1965,37 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         Log("  Dispositivo sin root. Procediendo...");
         ct.ThrowIfCancellationRequested();
 
-        // ── FASE 3: Verificar bootloader ──
+        // ── FASE 3: Bootloader. Desbloquearlo BORRA el teléfono: no es parte del root. ──
         Log("\n▸ FASE 3: Verificando estado del bootloader...");
         var blCheck = _adbService.CheckBootloaderUnlock(serial);
         var bootloaderUnlocked = AdbService.ParseBootloaderUnlocked(blCheck.Output) == true;
-        string? backupResult = null;
 
         if (!bootloaderUnlocked)
         {
-            Log("  Bootloader: BLOQUEADO");
-
-            if (isSamsung)
-            {
-                Log("");
-                LogOk("Samsung detectado — flujo especial:");
-                Log("  Samsung NO permite desbloqueo vía fastboot.");
-                Log("  Se procederá con backup + instrucciones para desbloqueo manual.");
-                Log("");
-
-                return await SamsungUnlockFlowAsync(serial, deviceInfo, ct);
-            }
-
-            Log("  Se procederá a desbloquear el bootloader automáticamente.");
-            Log("  ⚠ ESTO BORRARÁ TODOS LOS DATOS DEL DISPOSITIVO.");
+            LogError("Bootloader BLOQUEADO o estado desconocido.");
+            LogError("No se puede rootear sin desbloquearlo, y desbloquearlo BORRA todos los datos.");
+            Log("  El root automático no desbloquea el bootloader.");
+            Log("  No se ha reiniciado el teléfono. Tus datos siguen intactos.");
             Log("");
-
-            // Backup antes de desbloquear
-            Log("▸ FASE 3a: Creando backup de seguridad...");
-            backupResult = await CreateFullBackupAsync(serial, ct);
-            if (backupResult != null)
-            {
-                LogOk($"Backup completado en: {backupResult}");
-            }
-            else
-            {
-                LogError("No se pudo crear backup. Se CANCELA el desbloqueo para no perder datos.");
-                Log("  Habilita depuración USB y reintenta, o crea un backup manual.");
-                return RootMethodStatus.Failed;
-            }
-            ct.ThrowIfCancellationRequested();
-
-            // Desbloquear bootloader (backup ya creado arriba → skip)
-            Log("\n▸ FASE 3b: Desbloqueando bootloader...");
-            var unlockResult = await UnlockBootloaderAsync(serial, ct, skipBackup: true);
-            if (unlockResult == RootMethodStatus.WaitingDevice)
-            {
-                // Flujo manual (Samsung/otros): el usuario completa pasos y reejecuta
-                return unlockResult;
-            }
-            if (unlockResult != RootMethodStatus.Success)
-            {
-                LogError("No se pudo desbloquear el bootloader.");
-                Log("  Opciones manuales:");
-                Log("  1. Habilita 'Desbloqueo OEM' en Opciones de desarrollador");
-                Log("  2. Usa el método 'Desbloquear Bootloader' de la herramienta");
-                return RootMethodStatus.Failed;
-            }
-
-            LogOk("Bootloader desbloqueado. Esperando reinicio del dispositivo...");
-            Log("  El dispositivo se está formateando y reiniciando.");
-            Log("  Esto puede tardar 5-10 minutos en el primer arranque.");
-
-            // Esperar a que el dispositivo vuelva
-            var deviceBack = await WaitForDeviceReadyAsync(serial, ct);
-            ct.ThrowIfCancellationRequested();
-            if (!deviceBack)
-            {
-                // NO continuar a Magisk Patch: la USB debug puede estar apagada
-                // tras el wipe y el "éxito" sería falso.
-                LogError("El dispositivo no volvió a responder tras el desbloqueo/wipe.");
-                Log("  Pasos a seguir manualmente:");
-                Log("  1. Configura el teléfono de nuevo (asistente de Android)");
-                Log("  2. Activa 'Depuración USB' en Opciones de desarrollador");
-                Log("  3. Conecta al PC y pulsa 'Refresh'");
-                Log("  4. Ejecuta 'Magisk Patch' para completar el root");
-                if (backupResult != null)
-                    Log($"  Backup: {backupResult}");
-                return RootMethodStatus.Failed;
-            }
-        }
-        else
-        {
-            LogOk("Bootloader: DESBLOQUEADO");
+            Log("  Si aceptas perder fotos, apps y cuentas, es otro botón, aparte:");
+            Log("  'Desbloquear Bootloader' en métodos avanzados.");
+            Log("  No lo pulses si quieres conservar los datos.");
+            return RootMethodStatus.Failed;
         }
 
-        // ── FASE 4: Root via Magisk Patch ──
+        LogOk("Bootloader: DESBLOQUEADO");
+        Log("  Se parchea la partición boot. Eso no formatea tus datos.");
+        ct.ThrowIfCancellationRequested();
+
+        // ── FASE 4: Root via Magisk Patch (sin métodos experimentales detrás) ──
         Log("");
         Log("▸ FASE 4: Aplicando root via Magisk Patch...");
         Log("  Este proceso:");
         Log("  1. Extrae el boot.img del dispositivo");
         Log("  2. Lo parchea con Magisk");
-        Log("  3. Lo flashea de vuelta");
+        Log("  3. Lo flashea de vuelta (solo con bootloader ya desbloqueado)");
         Log("  4. Reinicia el dispositivo");
+        Log("  No se borran fotos, apps ni cuentas.");
         Log("");
 
         var magiskResult = await MagiskRootAsync(serial, ct);
@@ -2069,69 +2011,39 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             Log("  2. Ábrela para completar la configuración inicial");
             Log("  3. Si Magisk no aparece, descárgala desde:");
             Log("     https://github.com/topjohnwu/Magisk/releases");
-            Log("");
-            if (backupResult != null)
-            {
-                Log($"  Tu backup está en: {backupResult}");
-                Log("  Usa 'Restaurar' para recuperar tus datos si es necesario.");
-            }
             return RootMethodStatus.Success;
         }
 
-        LogError("El root via Magisk Patch falló.");
-        Log("  Intentando método alternativo...");
-        ct.ThrowIfCancellationRequested();
+        LogError("El root via Magisk Patch no se completó.");
+        Log("  No se intentan métodos experimentales: no rootearían y pueden reiniciar el teléfono.");
+        Log("  Los datos de usuario no se han borrado.");
+        Log($"  Dispositivo: {deviceInfo.Manufacturer} {model}");
+        Log($"  Android: {androidVersion}");
+        return magiskResult == RootMethodStatus.WaitingDevice
+            ? RootMethodStatus.WaitingDevice
+            : RootMethodStatus.Failed;
+    }
 
-        // ── FASE 5: Fallback — ADB Exploit ──
-        Log("\n▸ FASE 5: Intentando ADB Exploit como alternativa...");
-        var adbResult = await AdbExploitRootAsync(serial, ct);
-        if (adbResult == RootMethodStatus.Success)
-        {
-            LogOk("Root logrado via ADB Exploit.");
-            return RootMethodStatus.Success;
-        }
-
-        // ── FASE 6: Fallback — Fastboot Boot temporal ──
-        Log("\n▸ FASE 6: Intentando Fastboot Boot (root temporal)...");
-        Log("  Si el root permanente falló, este método puede");
-        Log("  darte root temporal para diagnosticar el problema.");
-        var fastbootResult = await FastbootBootAsync(serial, ct);
-        if (fastbootResult == RootMethodStatus.Success)
-        {
-            LogWarning("Root temporal activo. Se pierde al reiniciar.");
-            Log("  Usa 'Magisk Patch' para hacerlo permanente.");
-            return RootMethodStatus.Success;
-        }
-
-        // ── RESULTADO FINAL ──
-        Log("");
-        LogError("═══════════════════════════════════════════");
-        LogError("  NO SE PUDO ROOTEAR EL DISPOSITIVO");
-        LogError("═══════════════════════════════════════════");
-        Log("");
-        Log("  Causas posibles:");
-        Log("  • SELinux estricto bloquea los exploits");
-        Log("  • El boot.img no es compatible con Magisk");
-        Log("  • El bootloader sigue bloqueado");
-        Log("  • El fabricante bloqueó el root (ej: Huawei,Some Xiaomi)");
-        Log("");
-        Log("  Soluciones:");
-        Log("  1. Intenta 'Magisk Patch' directamente desde la lista");
-        Log("  2. Busca en XDA tu modelo específico + 'root guide'");
-        Log("  3. Verifica que el bootloader esté desbloqueado");
-        Log("");
-        Log("  Dispositivo: " + deviceInfo.Manufacturer + " " + model);
-        Log("  Android: " + androidVersion);
-
-        return RootMethodStatus.Failed;
+    /// <summary>
+    /// Carpeta nueva por intento. Reutilizar backup/{serial} hacía que archivos
+    /// de un intento viejo contaran como backup de hoy y autorizaran el wipe.
+    /// </summary>
+    private static string CreateFreshBackupDirectory(string serial)
+    {
+        var dir = Path.Combine(
+            AppDomain.CurrentDomain.BaseDirectory,
+            "backup",
+            AdbService.SanitizeSerialForPath(serial),
+            DateTime.Now.ToString("yyyyMMdd-HHmmss-fff"));
+        Directory.CreateDirectory(dir);
+        return dir;
     }
 
     private async Task<string?> CreateFullBackupAsync(string serial, CancellationToken ct)
     {
         try
         {
-            var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", AdbService.SanitizeSerialForPath(serial));
-            Directory.CreateDirectory(backupDir);
+            var backupDir = CreateFreshBackupDirectory(serial);
 
             Log("  [1/4] Backup de apps...");
             ct.ThrowIfCancellationRequested();
@@ -2152,8 +2064,13 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             ct.ThrowIfCancellationRequested();
             await BackupContactsSmsAsync(serial, backupDir, ct);
 
-            // Gate: backup vacío = fallido (los callers NO deben proceder al wipe).
-            int fileCount;
+            // Gate: sin apps/fotos/documentos de ESTE intento, el backup no es válido.
+            if (!RootSafetyPolicy.BackupHasUserFiles(apps.Count, media.Count, docs.Count))
+            {
+                LogError("Backup sin apps, fotos ni documentos — no se considera válido.");
+                return null;
+            }
+            var fileCount = 0;
             try
             {
                 fileCount = Directory.GetFiles(backupDir, "*", SearchOption.AllDirectories).Length;
@@ -2161,11 +2078,6 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             catch
             {
                 fileCount = 0;
-            }
-            if (fileCount == 0)
-            {
-                LogError("Backup vacío (0 archivos) — no se considera válido.");
-                return null;
             }
 
             // Crear resumen JSON
@@ -2400,6 +2312,14 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         // Gate de batería antes del parche/arranque — fail-closed
         if (!await EnsureMinBatteryAsync(serial, deviceInfo))
             return RootMethodStatus.Failed;
+
+        var blFastboot = _adbService.CheckBootloaderUnlock(serial);
+        if (AdbService.ParseBootloaderUnlocked(blFastboot.Output) != true)
+        {
+            LogError("Bootloader bloqueado o no confirmado. No se reinicia el teléfono.");
+            Log("  fastboot boot no rootearía, y desbloquear el bootloader BORRA los datos.");
+            return RootMethodStatus.Failed;
+        }
 
         ct.ThrowIfCancellationRequested();
 
@@ -2728,8 +2648,7 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         LogOk("Entorno MTKClient verificado.");
 
         Log("\n=== FASE 1: Backup de datos ===");
-        var backupDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backup", AdbService.SanitizeSerialForPath(serial));
-        Directory.CreateDirectory(backupDir);
+        var backupDir = CreateFreshBackupDirectory(serial);
 
         Log("\n[1/4] Backup de apps instaladas...");
         ct.ThrowIfCancellationRequested();
@@ -2750,24 +2669,17 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         ct.ThrowIfCancellationRequested();
         await BackupContactsSmsAsync(serial, backupDir, ct);
 
-        // Gate: no proceder al unlock MTK (wipe) con backup vacío.
-        int mtkBackupFileCount;
-        try
+        // Gate: no entrar en BROM ni desbloquear si este intento no copió datos reales.
+        if (!RootSafetyPolicy.BackupHasUserFiles(mtkApps.Count, mtkMedia.Count, mtkDocs.Count))
         {
-            mtkBackupFileCount = Directory.GetFiles(backupDir, "*", SearchOption.AllDirectories).Length;
-        }
-        catch
-        {
-            mtkBackupFileCount = 0;
-        }
-        if (mtkBackupFileCount == 0)
-        {
-            LogError("❌ Backup vacío — se CANCELA el MTK unlock para evitar pérdida de datos.");
-            Log("  Verifica la conexión ADB (depuración USB) y reintenta.");
+            LogError("❌ Backup sin apps, fotos ni documentos — se CANCELA el MTK unlock.");
+            Log("  No se ha pasado a modo BROM. Tus datos siguen intactos.");
+            Log("  Este backup no salva el teléfono: el desbloqueo lo formatea.");
             return RootMethodStatus.Failed;
         }
 
-        LogOk($"Backup completado: {backupDir} ({mtkBackupFileCount} archivos)");
+        LogWarning($"Backup PARCIAL en: {backupDir}");
+        LogWarning("No es una copia completa. El desbloqueo MTK BORRA el teléfono.");
 
         Log("\n=== FASE 2: Modo BROM ===");
         Log("1. APAGA el teléfono por completo.");

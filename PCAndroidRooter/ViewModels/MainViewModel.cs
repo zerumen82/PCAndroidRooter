@@ -146,41 +146,42 @@ public partial class MainViewModel : ObservableObject
         {
             Name = "One-Click Root",
             Description = "Intenta automáticamente todos los métodos",
-            FriendlyName = " Root Automático (Recomendado)",
-            FriendlyDescription = "Detecta tu dispositivo y elige el mejor método solo",
+            FriendlyName = " Root Automático",
+            FriendlyDescription = "Solo si el bootloader ya está desbloqueado. No borra fotos ni apps. Si está bloqueado, no hace nada.",
             Type = RootMethodType.OneClickRoot,
             Icon = "\uE73A",
-            Difficulty = "Fácil",
-            RiskLevel = "Bajo"
+            Difficulty = "Media",
+            RiskLevel = "Medio"
         });
         RootMethods.Add(new RootMethod
         {
             Name = "Magisk Patch",
             Description = "Parchea boot.img con Magisk (recomendado)",
             FriendlyName = "Root con Magisk",
-            FriendlyDescription = "El método más seguro y confiable. Parchea el archivo de arranque.",
+            FriendlyDescription = "No borra tus datos. Parchea el arranque y guarda una copia del boot original. Requiere bootloader ya desbloqueado.",
             Type = RootMethodType.MagiskPatch,
             Icon = "\uE730",
             Difficulty = "Media",
-            RiskLevel = "Bajo"
+            RiskLevel = "Medio"
         });
         RootMethods.Add(new RootMethod
         {
             Name = "KernelSU",
             Description = "Alternativa ligera a Magisk",
-            FriendlyName = "Root con KernelSU",
-            FriendlyDescription = "Alternativa más ligera a Magisk. Misma seguridad.",
+            FriendlyName = "KernelSU (no disponible)",
+            FriendlyDescription = "No está implementado. Antes ejecutaba Magisk con otro nombre.",
             Type = RootMethodType.KernelSU,
             Icon = "\uE730",
-            Difficulty = "Media",
-            RiskLevel = "Bajo"
+            Difficulty = "—",
+            RiskLevel = "—",
+            Status = RootMethodStatus.NotSupported
         });
         RootMethods.Add(new RootMethod
         {
             Name = "Desbloquear Bootloader",
             Description = "Desbloquea el bootloader (borra datos)",
-            FriendlyName = "Desbloquear Bootloader",
-            FriendlyDescription = "Paso previo necesario para algunos métodos. Borra los datos del teléfono.",
+            FriendlyName = "Desbloquear Bootloader (BORRA TODO)",
+            FriendlyDescription = "NO es root. Formatea el teléfono. El backup automático no recupera apps, cuentas ni chats.",
             Type = RootMethodType.BootloaderUnlock,
             Icon = "\uE785",
             Difficulty = "Media",
@@ -191,25 +192,27 @@ public partial class MainViewModel : ObservableObject
         {
             Name = "ADB Exploit",
             Description = "Explota vulnerabilidades vía ADB",
-            FriendlyName = "Root por ADB (Experimental)",
-            FriendlyDescription = "Funciona solo en algunos dispositivos antiguos. No garantizado.",
+            FriendlyName = "Root por ADB (no disponible)",
+            FriendlyDescription = "No está implementado. No se intenta y no modifica el teléfono.",
             Type = RootMethodType.AdbExploit,
             Icon = "\uE74C",
-            Difficulty = "Avanzado",
-            RiskLevel = "Medio",
-            IsAdvanced = true
+            Difficulty = "—",
+            RiskLevel = "—",
+            IsAdvanced = true,
+            Status = RootMethodStatus.NotSupported
         });
         RootMethods.Add(new RootMethod
         {
             Name = "TWRP Recovery",
             Description = "Instala recovery personalizado + Magisk",
-            FriendlyName = "Root con Recovery",
-            FriendlyDescription = "Instala un recovery personalizado. Requiere conocimientos técnicos.",
+            FriendlyName = "Recovery (no disponible)",
+            FriendlyDescription = "No instala ningún recovery. Antes solo reiniciaba el teléfono.",
             Type = RootMethodType.CustomRecovery,
             Icon = "\uE74C",
-            Difficulty = "Avanzado",
-            RiskLevel = "Alto",
-            IsAdvanced = true
+            Difficulty = "—",
+            RiskLevel = "—",
+            IsAdvanced = true,
+            Status = RootMethodStatus.NotSupported
         });
         RootMethods.Add(new RootMethod
         {
@@ -240,8 +243,8 @@ public partial class MainViewModel : ObservableObject
         {
             Name = "MTKClient Unlock",
             Description = "Desbloqueo vía bootrom MediaTek (sin toggle OEM)",
-            FriendlyName = "Desbloqueo MediaTek (avanzado)",
-            FriendlyDescription = "Para dispositivos MediaTek. Requiere abrir el teléfono en algunos casos.",
+            FriendlyName = "Desbloqueo MediaTek (BORRA TODO)",
+            FriendlyDescription = "No es root. Formatea el teléfono. El backup automático no guarda tus datos.",
             Type = RootMethodType.MtkClientUnlock,
             Icon = "\uE74C",
             Difficulty = "Avanzado",
@@ -346,22 +349,14 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
-        // Samsung → always manual flow
-        if (info.Manufacturer.Equals("samsung", StringComparison.OrdinalIgnoreCase))
+        // Bootloader cerrado: rootear implica formatear. No recomendar nada que borre.
+        if (!info.BootloaderUnlocked)
         {
-            SetRecommended(RootMethodType.OneClickRoot, "Tu Samsung necesita un proceso especial. One-Click Root te guiará.");
+            StatusText = "Bootloader bloqueado. No se recomienda rootear: desbloquearlo borraría tus datos.";
             return;
         }
 
-        // MediaTek → MTKClient if available
-        if (info.IsMediaTek && !info.BootloaderUnlocked)
-        {
-            SetRecommended(RootMethodType.MtkClientUnlock, "Chipset MediaTek detectado. MTKClient puede desbloquear sin toggle OEM.");
-            return;
-        }
-
-        // Default: recommend One-Click Root for everyone
-        SetRecommended(RootMethodType.OneClickRoot, "Este método detecta tu dispositivo y elige la mejor opción automáticamente.");
+        SetRecommended(RootMethodType.MagiskPatch, "Bootloader desbloqueado. Magisk no borra tus datos.");
     }
 
     private void SetRecommended(RootMethodType type, string reason)
@@ -405,25 +400,45 @@ public partial class MainViewModel : ObservableObject
 
         if (IsRooting) return;
 
-        // Always confirm: One-Click may unlock bootloader (wipe) if locked
-        bool isOneClick = method.Type == RootMethodType.OneClickRoot;
-        if (isOneClick && !BootloaderUnlocked)
+        if (!method.IsAvailable || RootSafetyPolicy.IsFakeOrUnsupported(method.Type))
         {
-            var wipeResult = MessageBox.Show(
-                "ADVERTENCIA: El bootloader está BLOQUEADO.\n\n" +
-                "One-Click Root intentará desbloquearlo automáticamente.\n" +
-                "ESTO BORRARÁ TODOS LOS DATOS del teléfono (fotos, apps, contactos, archivos).\n\n" +
-                "¿Deseas continuar?",
-                "Confirmar borrado de datos",
+            AppendLog($"'{method.FriendlyName}' no está disponible. No se ha modificado el teléfono.");
+            return;
+        }
+
+        // El root no desbloquea. Si la UI ve el bootloader cerrado, ni siquiera empieza.
+        bool isOneClick = method.Type == RootMethodType.OneClickRoot;
+        if ((isOneClick || method.Type == RootMethodType.MagiskPatch || method.Type == RootMethodType.FastbootBoot)
+            && !BootloaderUnlocked)
+        {
+            MessageBox.Show(
+                "El bootloader está BLOQUEADO (o no se ha podido confirmar).\n\n" +
+                "Rootear este teléfono exigiría desbloquearlo, y eso BORRA todos los datos.\n\n" +
+                "No se ha hecho nada. El teléfono sigue igual.",
+                "No se toca el teléfono",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            AppendLog("Root cancelado: bootloader bloqueado. No se ha borrado nada.");
+            return;
+        }
+
+        if (isOneClick)
+        {
+            var proceed = MessageBox.Show(
+                "El bootloader figura como desbloqueado.\n\n" +
+                "Se parcheará la partición boot con Magisk. Esto NO borra fotos, apps ni cuentas.\n" +
+                "Si el parche falla, el teléfono podría no encender hasta restaurar el boot original (se guarda una copia).\n\n" +
+                "¿Continuar?",
+                "Root sin borrar datos",
                 MessageBoxButton.OKCancel,
                 MessageBoxImage.Warning);
-            if (wipeResult != MessageBoxResult.OK)
+            if (proceed != MessageBoxResult.OK)
             {
-                AppendLog("Operación cancelada por el usuario (confirmación de borrado).");
+                AppendLog("Operación cancelada por el usuario.");
                 return;
             }
         }
-        else if (!isOneClick)
+        else
         {
             var warning = GetRootWarning(method);
             if (!string.IsNullOrEmpty(warning))
@@ -489,19 +504,29 @@ public partial class MainViewModel : ObservableObject
 
         if (!BootloaderUnlocked)
         {
-            var wipeResult = MessageBox.Show(
-                "ADVERTENCIA: El bootloader está BLOQUEADO.\n\n" +
-                "One-Click Root intentará desbloquearlo automáticamente.\n" +
-                "ESTO BORRARÁ TODOS LOS DATOS del teléfono (fotos, apps, contactos, archivos).\n\n" +
-                "¿Deseas continuar?",
-                "Confirmar borrado de datos",
-                MessageBoxButton.OKCancel,
-                MessageBoxImage.Warning);
-            if (wipeResult != MessageBoxResult.OK)
-            {
-                AppendLog("Operación cancelada por el usuario (confirmación de borrado).");
-                return;
-            }
+            MessageBox.Show(
+                "El bootloader está BLOQUEADO (o no se ha podido confirmar).\n\n" +
+                "Rootear exigiría desbloquearlo, y eso BORRA todos los datos.\n\n" +
+                "No se ha hecho nada. El teléfono sigue igual.",
+                "No se toca el teléfono",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            AppendLog("Root automático cancelado: bootloader bloqueado. No se ha borrado nada.");
+            return;
+        }
+
+        var proceed = MessageBox.Show(
+            "El bootloader figura como desbloqueado.\n\n" +
+            "Se parcheará la partición boot con Magisk. Esto NO borra fotos, apps ni cuentas.\n" +
+            "Si el parche falla, el teléfono podría no encender hasta restaurar el boot original (se guarda una copia).\n\n" +
+            "¿Continuar?",
+            "Root sin borrar datos",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Warning);
+        if (proceed != MessageBoxResult.OK)
+        {
+            AppendLog("Operación cancelada por el usuario.");
+            return;
         }
 
         // Find the OneClickRoot method
@@ -561,28 +586,22 @@ public partial class MainViewModel : ObservableObject
          return method.Type switch
          {
              RootMethodType.BootloaderUnlock =>
-                 "ADVERTENCIA: Desbloquear el bootloader BORRARÁ TODOS LOS DATOS del teléfono. " +
-                 "Se perderán fotos, aplicaciones, contactos y archivos. " +
-                 "Asegúrate de haber hecho un backup antes de continuar.",
+                 "ESTO NO ES ROOT. Desbloquear el bootloader BORRA TODO el teléfono.\n\n" +
+                 "El backup automático es parcial (unos APK sin sus datos, y pocas fotos). " +
+                 "NO recupera cuentas, chats, contraseñas ni la mayoría de archivos.\n\n" +
+                 "Si quieres conservar los datos, pulsa Cancelar.",
              RootMethodType.MagiskPatch =>
-                 "Vas a modificar el archivo de arranque del teléfono. " +
-                 "Si algo sale mal, el teléfono podría no encender. " +
-                 "Haremos un backup de seguridad antes de continuar.",
+                 "Se modifica el arranque del teléfono. NO se borran tus datos.\n\n" +
+                 "Si algo sale mal, el teléfono podría no encender hasta restaurar el boot original, que se guarda antes.",
              RootMethodType.AdbExploit =>
-                 "Este método es experimental. " +
-                 "Puede no funcionar en tu dispositivo. " +
-                 "Es seguro intentarlo — si falla, el teléfono queda como estaba.",
+                 "Este método no está implementado. No se modificará el teléfono.",
              RootMethodType.CustomRecovery =>
-                 "Vas a instalar un recovery personalizado. " +
-                 "Si el proceso se interrumpe, el teléfono podría quedar inservible. " +
-                 "Asegúrate de tener batería suficiente.",
+                 "Este método no instala un recovery. No se modificará el teléfono.",
              RootMethodType.KernelSU =>
-                 "Método alternativo a Magisk. Requiere bootloader desbloqueado. " +
-                 "El proceso es similar al de Magisk Patch.",
+                 "KernelSU no está implementado. No se modificará el teléfono.",
              RootMethodType.OneClickRoot =>
-                 "Este método intentará automáticamente varios métodos de root. " +
-                 "El proceso puede tardar varios minutos. " +
-                 "No desconectes el teléfono durante el proceso.",
+                 "Solo parchea el boot con Magisk si el bootloader ya está desbloqueado. " +
+                 "No borra tus datos. No desbloquea el bootloader.",
             RootMethodType.TemporaryRoot =>
                 "Root temporal NO disponible en esta versión. " +
                 "Usa 'Desbloquear Bootloader' + 'Magisk Patch' en su lugar.",
@@ -591,9 +610,9 @@ public partial class MainViewModel : ObservableObject
                      "NO modifica el teléfono permanentemente. " +
                      "Si algo falla, solo reinicia el teléfono.",
                 RootMethodType.MtkClientUnlock =>
-                    "Desbloqueo del bootloader para dispositivos MediaTek. " +
-                    "BORRARÁ TODOS LOS DATOS del teléfono. " +
-                    "Knox se dispara permanentemente.",
+                    "ESTO NO ES ROOT. El desbloqueo MediaTek BORRA TODO el teléfono.\n\n" +
+                    "El backup automático no guarda tus datos. Knox, si aplica, se dispara para siempre.\n\n" +
+                    "Si quieres conservar los datos, pulsa Cancelar.",
                 _ => null
          };
      }

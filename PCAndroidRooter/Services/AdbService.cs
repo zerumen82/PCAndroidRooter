@@ -553,28 +553,21 @@ namespace PCAndroidRooter.Services;
 
         info.IsRooted = isRooted;
 
-        var bootloaderResult = await Task.Run(() =>
+        // No usar sys.oem_unlock_allowed: es el toggle de desarrollador, no el
+        // bootloader. Confundirlos hacía que el root borrara el teléfono sin aviso.
+        var vbmeta = await Task.Run(() =>
+            ExecuteAdb($"-s {serial} shell getprop ro.boot.vbmeta.device_state"));
+        var flashLocked = await Task.Run(() =>
             ExecuteAdb($"-s {serial} shell getprop ro.boot.flash.locked"));
-        var blUnlocked = bootloaderResult.Success && bootloaderResult.Output.Trim() == "0";
-        if (!blUnlocked)
-        {
-            var oemResult = await Task.Run(() =>
-                ExecuteAdb($"-s {serial} shell getprop ro.oem_unlock_supported"));
-            if (oemResult.Success && oemResult.Output.Trim() == "1")
-            {
-                var unlockResult = await Task.Run(() =>
-                    ExecuteAdb($"-s {serial} shell getprop sys.oem_unlock_allowed"));
-                blUnlocked = unlockResult.Success && unlockResult.Output.Trim() == "1";
-            }
-            else
-            {
-                var otherLocked = await Task.Run(() =>
-                    ExecuteAdb($"-s {serial} shell getprop ro.boot.other.locked"));
-                if (otherLocked.Success && otherLocked.Output.Trim() == "0")
-                    blUnlocked = true;
-            }
-        }
-        info.BootloaderUnlocked = blUnlocked;
+        var verifiedBoot = await Task.Run(() =>
+            ExecuteAdb($"-s {serial} shell getprop ro.boot.verifiedbootstate"));
+        var otherLocked = await Task.Run(() =>
+            ExecuteAdb($"-s {serial} shell getprop ro.boot.other.locked"));
+        info.BootloaderUnlocked = RootSafetyPolicy.InterpretBootloaderState(
+            vbmeta.Success ? vbmeta.Output : null,
+            flashLocked.Success ? flashLocked.Output : null,
+            verifiedBoot.Success ? verifiedBoot.Output : null,
+            otherLocked.Success ? otherLocked.Output : null) == true;
 
         var ramResult = await Task.Run(() =>
                 ExecuteAdb($"-s {serial} shell cat /proc/meminfo"));
@@ -1003,10 +996,20 @@ namespace PCAndroidRooter.Services;
             var vbsVal = vbs.Success ? vbs.Output.Trim() : "";
             if (vbsVal.Equals("orange", StringComparison.OrdinalIgnoreCase))
                 return new AdbCommandResult { Success = true, Output = "unlocked: yes (adb ro.boot.verifiedbootstate=orange)" };
-            if (vbsVal.Equals("green", StringComparison.OrdinalIgnoreCase))
-                return new AdbCommandResult { Success = true, Output = "unlocked: no (adb ro.boot.verifiedbootstate=green)" };
+            if (vbsVal.Equals("green", StringComparison.OrdinalIgnoreCase) ||
+                vbsVal.Equals("yellow", StringComparison.OrdinalIgnoreCase) ||
+                vbsVal.Equals("red", StringComparison.OrdinalIgnoreCase))
+                return new AdbCommandResult { Success = true, Output = $"unlocked: no (adb ro.boot.verifiedbootstate={vbsVal})" };
+
+            var other = ExecuteAdb($"-s {serial} shell getprop ro.boot.other.locked", timeoutMs: 8000);
+            var otherVal = other.Success ? other.Output.Trim() : "";
+            if (otherVal == "0")
+                return new AdbCommandResult { Success = true, Output = "unlocked: yes (adb ro.boot.other.locked=0)" };
+            if (otherVal == "1")
+                return new AdbCommandResult { Success = true, Output = "unlocked: no (adb ro.boot.other.locked=1)" };
 
             // Device presente en ADB pero sin props diagnósticas → no intentar fastboot (bloquearía 60s).
+            // No consultar sys.oem_unlock_allowed: el toggle encendido no es un bootloader desbloqueado.
             return new AdbCommandResult { Success = true, Output = "unlocked: unknown (sin props de bootloader)" };
         }
 
