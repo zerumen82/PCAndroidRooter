@@ -77,7 +77,6 @@ Commit `594afa0` (`fix: root no longer wipes the phone`):
 
 ## Qué falta
 
-- Partir `RootService` en parche / restaurar / desbloqueo. El desbloqueo no lo puede llamar el root.
 - Si `dd` de la partición falla, pedir el `init_boot.img` / `boot.img` oficial de esa misma build (`ro.build.fingerprint`). No está hecho.
 - El backup de fotos y APK sigue siendo parcial (`Take(50)`, `head`). No es una copia del teléfono y no autoriza un wipe.
 - Código muerto que no hay que volver a cablear al root: `SamsungUnlockFlowAsync`, `AdbExploitRootAsync`, `TemporaryRootAsync`, `KernelSURootAsync`, `CustomRecoveryRootAsync`.
@@ -91,7 +90,7 @@ Los pasos 1 a 5 están hechos. El siguiente es el 6, y la imagen oficial si `dd`
 3. Hecho. Prueba con `fastboot boot` y `uid=0`. Si pasa, graba solo. En `init_boot` graba esa partición en el mismo paso. No usar `VerifyRoot` para decidir el flash: ese método da por bueno el paquete Magisk sin `su`.
 4. Hecho. Botón Restaurar boot.
 5. Hecho. Esos métodos ya no salen en la ventana.
-6. Pendiente. Partir `RootService`. Un tipo para el parche, otro para restaurar, otro para el desbloqueo. El de root no llama a `flashing unlock`, `oem unlock` ni a MTKClient.
+6. Hecho. `RootService` partida en `RootServiceBase` (log/eventos), `MagiskRootService` (parche, One-Click, fastboot boot, commit, restaurar boot, heimdall), `UnlockDangerService` (unlock OEM, MTK, Samsung Download, backups) y `RestoreService` (restaurar backup). `RootService` queda como fachada con la misma API. El root solo llega al unlock vía `IUnlockDanger` (gate de batería + `EnsureBootloaderForRootAsync`); no contiene `flashing unlock`, `oem unlock` ni MTKClient.
 
 ## Regla de corrección de problemas (obligatoria)
 

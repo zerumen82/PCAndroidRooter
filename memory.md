@@ -38,6 +38,13 @@ Refactor → plan aprobado antes de tocar código, **AGENTS.md manda**, revisar 
 1. **Root**: `OneClickRoot` y `MagiskPatch` (recorrido completo). `FastbootBoot` no desbloquea.
 2. **Zona de peligro (formatea)**: `BootloaderUnlock` y `MtkClientUnlock`. No son root, no se recomiendan, siempre con confirmación explícita. Nunca un paso del root.
 
+### Estructura de servicios (paso 6, no deshacer)
+- `MagiskRootService`: todo el recorrido de root. **Prohibido** meter aquí unlock, wipe, Download Mode de desbloqueo ni MTK.
+- `UnlockDangerService`: zona de peligro (formatea). `IUnlockDanger` es la única puerta desde el root: `EnsureBootloaderForRootAsync` + `EnsureMinBatteryForRootAsync`.
+- `RestoreService`: restauración de backups.
+- `RootService`: fachada; MainViewModel solo conoce esta.
+- `FlashSamsungDownloadAsync` vive en `MagiskRootService`: es **flash** de boot ya con bootloader abierto (no desbloquea ni formatea).
+
 ### Camino Magisk
 - `ChooseBootPartition`: `init_boot` del slot activo gana a `boot`; nunca el slot contrario.
 - `FlashBootViaFastboot` valida el nombre de partición (`init_boot_a`, `boot_b`, …) y rechaza el resto.
@@ -58,19 +65,18 @@ Refactor → plan aprobado antes de tocar código, **AGENTS.md manda**, revisar 
 
 ## Estado de la implementación
 
-Pasos 1–5 hechos; **el siguiente es el 6**:
+Pasos 1–6 hechos; **el siguiente es el 7**:
 
 1. ✅ `MayBeginRoot`, `MayFlashPermanent`, `MayUnlockDuringRoot`, `MayRestoreOriginal`.
 2. ✅ `ChooseBootPartition` + `IsFlashableBootPartition`.
 3. ✅ Prueba `fastboot boot` + `uid=0`; en `init_boot` graba en el mismo paso. (No usar `VerifyRoot` para decidir el flash: da por bueno el paquete Magisk sin `su`.)
 4. ✅ Botón Restaurar boot.
 5. ✅ Métodos falsos fuera de la ventana.
-6. ⬜ **Pendiente**: partir `RootService` en parche / restaurar / desbloqueo. El de root no llama a `flashing unlock`, `oem unlock` ni MTKClient.
-7. ⬜ Si `dd` falla, pedir el `init_boot.img` / `boot.img` oficial de la misma build (`ro.build.fingerprint`). No hecho.
+6. ✅ `RootService` partida: `RootServiceBase` (log/eventos), `MagiskRootService` (parche, One-Click, fastboot boot, commit, restaurar boot, heimdall Samsung), `UnlockDangerService` (unlock OEM, MTK, Samsung Download unlock, backups) y `RestoreService` (restaurar backup). `RootService` = fachada, misma API. El root llega al unlock solo vía `IUnlockDanger`; sin `flashing unlock`/`oem unlock`/MTK en el root.
+7. ⬜ **Pendiente**: si `dd` falla, pedir el `init_boot.img` / `boot.img` oficial de la misma build (`ro.build.fingerprint`).
 
 ## Pendientes / conocidos
 
-- Partir `RootService` (paso 6 de arriba).
 - Imagen oficial de boot si `dd` falla (paso 7 de arriba).
 - Backup de fotos y APK parcial (`Take(50)`, `head`): no es copia del teléfono ni autoriza un wipe.
 - Código muerto que **no** hay que recablear al root: `SamsungUnlockFlowAsync`, `AdbExploitRootAsync`, `TemporaryRootAsync`, `KernelSURootAsync`, `CustomRecoveryRootAsync`.
