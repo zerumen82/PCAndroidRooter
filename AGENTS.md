@@ -13,7 +13,8 @@ Estructura obligatoria del plan:
 2. **Cumplimiento de AGENTS.md** — reglas que aplican y cómo las respeta el plan.
 3. **Pasos de implementación** — lista ordenada con archivos concretos.
 4. **Riesgos y límites** — qué NO se hará y por qué.
-5. **Verificación** — `dotnet test PCAndroidRooter.sln` en verde; tests de política nuevos en `PCAndroidRooter.Tests` si aplica.
+5. **Impacto** — confirmar que no entorpezca el desarrollo (no rompa flujos, no bloquee el roadmap, no añada deuda) y que beneficie al proyecto.
+6. **Verificación** — `dotnet test PCAndroidRooter.sln` en verde; tests de política nuevos en `PCAndroidRooter.Tests` si aplica.
 
 Detalle completo en `.agents/skills/plan/SKILL.md` (formato abierto, válido en cualquier CLI con soporte de skills).
 
@@ -96,6 +97,7 @@ Los pasos 1 a 5 están hechos. El siguiente es el 6, y la imagen oficial si `dd`
 
 Cuando el usuario pida **corregir un problema/bug**:
 
+0. **Plan básico primero**: mostrar un plan breve (petición del usuario con sus ideas, contexto + `memory.md`, causa probable, pasos con archivos, verificación, impacto, límites) y esperar su aprobación antes de editar código. El plan debe confirmar que lo que se va a hacer **no entorpezca el desarrollo** (no rompa flujos, no bloquee el roadmap, no añada deuda) y que **beneficie** al proyecto.
 1. **Escuchar al usuario primero**: ser 100% receptivo a sus ideas; probar su sospecha/solución propuesta antes que ninguna otra. Desviarse solo con su acuerdo.
 2. **Leer AGENTS.md** y respetar todas sus reglas (nada de unlock en el root, nada de exploits, etc.).
 3. **Revisar `memory.md`** para no repetir soluciones ya intentadas ni deshacer decisiones consolidadas.

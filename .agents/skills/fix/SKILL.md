@@ -7,6 +7,20 @@ description: Corrige problemas/bugs siendo 100% receptivo a las ideas del usuari
 
 Cuando el usuario pida corregir un problema o bug:
 
+## 0. Plan básico antes de tocar código
+
+Elabora un **plan básico** y muéstralo antes de editar nada (salvo diagnóstico trivial y acuerdo del usuario):
+
+1. **Petición** — el problema en palabras del usuario + sus ideas/sospechas (van primero).
+2. **Contexto** — archivos/flujos afectados y qué dice `memory.md` de esa zona.
+3. **Causa probable** — hipótesis de causa raíz, ordenadas.
+4. **Pasos de corrección** — cortos, con archivos concretos, cambios mínimos.
+5. **Verificación** — test que reproduce el fallo (falle → pase) y suite del proyecto en verde.
+6. **Impacto** — confirmar que la corrección **no entorpezca el desarrollo** (no rompa flujos existentes, no bloquee el roadmap, no añada deuda) y que **beneficie** al proyecto; si el beneficio es dudoso, plantearlo antes de actuar.
+7. **Límites** — qué NO se tocará según las instrucciones del proyecto.
+
+Usa la lista de tareas (todo list) del CLI para registrar los pasos y mantenerlos actualizados.
+
 ## 1. Escuchar al usuario (prioridad máxima)
 
 - **Sé 100% receptivo a sus ideas.** Si el usuario propone una solución o sospecha, pruébala primero y dale prioridad. No la descartes sin haberla evaluado de verdad.

@@ -15,11 +15,11 @@ el desbloqueo OEM / `fastboot flashing unlock` / MTK `seccfg unlock` hace factor
 
 ## Regla de planificación (cualquier CLI)
 
-Funcionalidad nueva → primero plan, aprobación del usuario, después código. **AGENTS.md manda siempre** sobre cualquier idea del plan. Estructura: contexto, cumplimiento de AGENTS.md, pasos con archivos, riesgos/límites, verificación con tests. Detalle en `.agents/skills/plan/SKILL.md` y `.codebuff/commands/plan.md`.
+Funcionalidad nueva → primero plan, aprobación del usuario, después código. **AGENTS.md manda siempre** sobre cualquier idea del plan. Estructura: contexto, cumplimiento de AGENTS.md, pasos con archivos, riesgos/límites, **impacto** (no entorpecer el desarrollo, beneficiar al proyecto), verificación con tests. Detalle en `.agents/skills/plan/SKILL.md` y `.codebuff/commands/plan.md`.
 
 ## Regla de corrección de problemas (cualquier CLI)
 
-Corregir bug → 100% receptivo a las ideas del usuario (probar su sospecha primero), respetar AGENTS.md, revisar este archivo para **no repetir** intentos fallidos, máximo esfuerzo (causa raíz, tests) y buscar en internet soluciones nuevas si las conocidas no bastan. Detalle en `.agents/skills/fix/SKILL.md`.
+Corregir bug → **plan básico primero** (petición del usuario con sus ideas, contexto + este archivo, causa probable, pasos con archivos, verificación, **impacto**, límites) y aprobación antes de editar. Luego: 100% receptivo a las ideas del usuario (probar su sospecha primero), respetar AGENTS.md, revisar este archivo para **no repetir** intentos fallidos, máximo esfuerzo (causa raíz, tests), buscar en internet soluciones nuevas si las conocidas no bastan e incluir chequeo de **impacto** (no entorpecer el desarrollo, beneficiar al proyecto). Detalle en `.agents/skills/fix/SKILL.md` y `.codebuff/commands/fix.md`.
 
 ## Regla de refactorización (cualquier CLI)
 

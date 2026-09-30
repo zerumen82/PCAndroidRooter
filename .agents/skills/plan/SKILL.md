@@ -22,7 +22,8 @@ Antes de escribir **cualquier** código de una funcionalidad nueva, elabora un p
 2. **Cumplimiento de AGENTS.md** — cita las reglas que aplican y cómo las respeta el plan. Si hay conflicto, decláralo aquí.
 3. **Pasos de implementación** — lista ordenada, cada paso con el/los archivos a tocar.
 4. **Riesgos y límites** — qué NO se hará y por qué (según AGENTS.md).
-5. **Verificación** — cómo se comprueba: `dotnet test PCAndroidRooter.sln` en verde, tests de política nuevos en `PCAndroidRooter.Tests` si aplica, typecheck.
+5. **Impacto** — confirmar que la funcionalidad **no entorpezca el desarrollo** (no rompa flujos existentes, no bloquee el roadmap, no añada deuda) y que **beneficie** al proyecto; si el beneficio es dudoso, plantearlo antes de actuar.
+6. **Verificación** — cómo se comprueba: `dotnet test PCAndroidRooter.sln` en verde, tests de política nuevos en `PCAndroidRooter.Tests` si aplica, typecheck.
 
 ## Reglas del plan
 
