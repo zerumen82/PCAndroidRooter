@@ -105,6 +105,19 @@ Cuando el usuario pida **corregir un problema/bug**:
 
 Detalle completo en `.agents/skills/fix/SKILL.md`.
 
+## Regla de refactorización (obligatoria)
+
+Cuando el usuario pida **refactorizar / partir / reorganizar código**:
+
+1. **Plan primero**: aplicar la regla de planificación (plan mostrado y aprobado antes de tocar código).
+2. **AGENTS.md manda**: ninguna idea del plan puede contradecirlo (p. ej. el paso 6 de partir `RootService` no puede dar acceso al unlock al root).
+3. **Revisar `memory.md`** para no deshacer lo consolidado ni revivir código muerto (`SamsungUnlockFlowAsync`, `AdbExploitRootAsync`, `TemporaryRootAsync`, `KernelSURootAsync`, `CustomRecoveryRootAsync`).
+4. **Cero cambios de comportamiento**: mismo resultado externo; bug detectado se corrige aparte.
+5. **Pasos pequeños**: cada paso compila y deja `dotnet test PCAndroidRooter.sln` en verde antes del siguiente.
+6. Si se toca una decisión anotada en `memory.md`, actualizarla al cerrar.
+
+Detalle completo en `.agents/skills/refactor/SKILL.md`.
+
 ## Al tocar el código
 
 - No volver a meter unlock, wipe, Download Mode ni MTK dentro de One-Click, Magisk o Fastboot Boot.

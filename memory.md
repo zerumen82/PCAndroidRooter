@@ -21,6 +21,10 @@ Funcionalidad nueva → primero plan, aprobación del usuario, después código.
 
 Corregir bug → 100% receptivo a las ideas del usuario (probar su sospecha primero), respetar AGENTS.md, revisar este archivo para **no repetir** intentos fallidos, máximo esfuerzo (causa raíz, tests) y buscar en internet soluciones nuevas si las conocidas no bastan. Detalle en `.agents/skills/fix/SKILL.md`.
 
+## Regla de refactorización (cualquier CLI)
+
+Refactor → plan aprobado antes de tocar código, **AGENTS.md manda**, revisar este archivo para no deshacer lo consolidado ni revivir código muerto, cero cambios de comportamiento, pasos pequeños con tests en verde tras cada uno. Detalle en `.agents/skills/refactor/SKILL.md`.
+
 ## Decisiones consolidadas (no deshacer)
 
 ### Seguridad
