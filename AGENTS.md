@@ -92,6 +92,19 @@ Los pasos 1 a 5 están hechos. El siguiente es el 6, y la imagen oficial si `dd`
 5. Hecho. Esos métodos ya no salen en la ventana.
 6. Pendiente. Partir `RootService`. Un tipo para el parche, otro para restaurar, otro para el desbloqueo. El de root no llama a `flashing unlock`, `oem unlock` ni a MTKClient.
 
+## Regla de corrección de problemas (obligatoria)
+
+Cuando el usuario pida **corregir un problema/bug**:
+
+1. **Escuchar al usuario primero**: ser 100% receptivo a sus ideas; probar su sospecha/solución propuesta antes que ninguna otra. Desviarse solo con su acuerdo.
+2. **Leer AGENTS.md** y respetar todas sus reglas (nada de unlock en el root, nada de exploits, etc.).
+3. **Revisar `memory.md`** para no repetir soluciones ya intentadas ni deshacer decisiones consolidadas.
+4. **Máximo esfuerzo**: causa raíz antes que parche, diagnóstico con tests, no parar en el primer intento.
+5. **Buscar en internet** soluciones nuevas cuando las conocidas no bastan (mensaje de error exacto + versión de la librería), contrastando con documentación oficial.
+6. Cerrar con `dotnet test PCAndroidRooter.sln` en verde y un resumen de qué se probó sin éxito (candidato a anotar en `memory.md`).
+
+Detalle completo en `.agents/skills/fix/SKILL.md`.
+
 ## Al tocar el código
 
 - No volver a meter unlock, wipe, Download Mode ni MTK dentro de One-Click, Magisk o Fastboot Boot.
