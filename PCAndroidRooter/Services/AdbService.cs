@@ -618,79 +618,61 @@ namespace PCAndroidRooter.Services;
 
     public async Task<BootPartitionInfo?> FindBootPartitionAsync(string serial, CancellationToken ct = default)
     {
-        var possiblePaths = new[]
+        GuardValidSerial(serial);
+        var slot = BootImageValidator.DetectActiveBootSlot(serial, cmd =>
         {
-            "/dev/block/by-name/boot_a",
-            "/dev/block/by-name/boot_b",
-            "/dev/block/by-name/boot",
-            "/dev/block/bootdevice/by-name/boot",
-            "/dev/block/platform/*/by-name/boot",
-            "/dev/block/boot",
-            "/dev/bootimg"
-        };
+            var r = Shell(serial, cmd);
+            return (r.Success, r.Output);
+        });
 
-        foreach (var pathTemplate in possiblePaths)
+        foreach (var dir in new[] { "/dev/block/by-name", "/dev/block/bootdevice/by-name" })
         {
-            if (pathTemplate.Contains('*'))
-            {
-                var findResult = await Task.Run(() =>
-                    ExecuteAdb($"-s {serial} shell \"ls {pathTemplate} 2>/dev/null\"", ct: ct), ct);
-                if (findResult.Success && !ct.IsCancellationRequested)
-                {
-                    var lines = findResult.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-                    foreach (var line in lines)
-                    {
-                        if (ct.IsCancellationRequested) return null;
-                        var realPath = line.Trim();
-                        if (!string.IsNullOrEmpty(realPath))
-                        {
-                            var checkResult = await Task.Run(() =>
-                                ExecuteAdb($"-s {serial} shell \"ls -l {realPath} 2>/dev/null\"", ct: ct), ct);
-                            if (checkResult.Success && !ct.IsCancellationRequested)
-                            {
-                                var sizeResult = await Task.Run(() =>
-                                    ExecuteAdb($"-s {serial} shell \"wc -c < {realPath} 2>/dev/null\""));
-                                long.TryParse(sizeResult.Output.Trim(), out var size);
+            ct.ThrowIfCancellationRequested();
+            var listed = await ListBootNamesAsync(serial, dir, ct);
+            var chosen = RootSafetyPolicy.ChooseBootPartition(listed, slot);
+            if (chosen == null) continue;
 
-                                return new BootPartitionInfo
-                                {
-                                    Path = realPath,
-                                    Size = size,
-                                    Accessible = true,
-                                    BlockDevice = realPath
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-            else
-            {
-                if (ct.IsCancellationRequested) return null;
-                var checkResult = await Task.Run(() =>
-                    ExecuteAdb($"-s {serial} shell \"ls -l {pathTemplate} 2>/dev/null\"", ct: ct), ct);
-                if (checkResult.Success && !ct.IsCancellationRequested)
-                {
-                    var realPath = checkResult.Output.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)
-                        .LastOrDefault() ?? pathTemplate;
-
-                    var sizeResult = await Task.Run(() =>
-                        ExecuteAdb($"-s {serial} shell \"wc -c < {pathTemplate} 2>/dev/null\"", ct: ct), ct);
-                    long.TryParse(sizeResult.Output.Trim(), out var size);
-
-                    return new BootPartitionInfo
-                    {
-                        Path = pathTemplate,
-                        Size = size,
-                        Accessible = true,
-                        BlockDevice = realPath
-                    };
-                }
-            }
+            var path = $"{dir}/{chosen}";
+            if (!IsValidBlockPath(path)) continue;
+            var info = await DescribeBlockAsync(serial, path, chosen, ct);
+            if (info != null) return info;
         }
 
-        OutputReceived?.Invoke("No se encontró la partición boot automáticamente.");
+        OutputReceived?.Invoke("No se encontró init_boot ni boot.");
         return null;
+    }
+
+    private async Task<HashSet<string>> ListBootNamesAsync(string serial, string dir, CancellationToken ct)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var ls = await Task.Run(() =>
+            ExecuteAdb($"-s {serial} shell ls {dir}", ct: ct, timeoutMs: 8000), ct);
+        if (!ls.Success) return names;
+        foreach (var line in ls.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var name = line.Trim();
+            if (RootSafetyPolicy.IsFlashableBootPartition(name))
+                names.Add(name);
+        }
+        return names;
+    }
+
+    private async Task<BootPartitionInfo?> DescribeBlockAsync(string serial, string path, string fastbootName, CancellationToken ct)
+    {
+        var check = await Task.Run(() =>
+            ExecuteAdb($"-s {serial} shell ls -l {path}", ct: ct, timeoutMs: 8000), ct);
+        if (!check.Success || check.Output.Contains("No such file")) return null;
+        var sizeResult = await Task.Run(() =>
+            ExecuteAdb($"-s {serial} shell wc -c < {path}", ct: ct, timeoutMs: 8000), ct);
+        long.TryParse(sizeResult.Output.Trim(), out var size);
+        return new BootPartitionInfo
+        {
+            Path = path,
+            Size = size,
+            Accessible = true,
+            BlockDevice = path,
+            FastbootPartition = fastbootName
+        };
     }
 
     public async Task<bool> ExtractBootImgAsync(string serial, BootPartitionInfo partition, string outputPath, CancellationToken ct = default)
@@ -872,9 +854,16 @@ namespace PCAndroidRooter.Services;
         return false;
     }
 
-    public bool FlashBootViaFastboot(string serial, string bootImgPath)
+    public bool FlashBootViaFastboot(string serial, string bootImgPath, string partitionName)
     {
-        OutputReceived?.Invoke($"Flasheando {bootImgPath} vía fastboot...");
+        if (!RootSafetyPolicy.IsFlashableBootPartition(partitionName))
+        {
+            OutputReceived?.Invoke($"ERROR: Partición no permitida ({partitionName}). Solo boot o init_boot.");
+            return false;
+        }
+
+        var partition = RootSafetyPolicy.FastbootNameFromBlockPath(partitionName);
+        OutputReceived?.Invoke($"Flasheando {partition}: {bootImgPath}");
 
         if (string.IsNullOrEmpty(serial) || serial == "?")
         {
@@ -888,8 +877,33 @@ namespace PCAndroidRooter.Services;
             return false;
         }
 
+        if (string.IsNullOrEmpty(bootImgPath) || !File.Exists(bootImgPath))
+        {
+            OutputReceived?.Invoke("ERROR: La imagen a flashear no existe.");
+            return false;
+        }
+
         var target = ResolveFastbootTarget(serial);
-        var result = ExecuteFastboot($"-s {target} flash boot \"{bootImgPath}\"", timeoutMs: 120000);
+        var result = ExecuteFastboot($"-s {target} flash {partition} \"{bootImgPath}\"", timeoutMs: 120000);
+        return result.Success;
+    }
+
+    /// <summary>Arranque de una sola vez. No escribe la partición. No sirve para init_boot.</summary>
+    public bool BootImageViaFastboot(string serial, string bootImgPath)
+    {
+        if (string.IsNullOrEmpty(serial) || !IsValidSerial(serial))
+        {
+            OutputReceived?.Invoke("ERROR: Serial de dispositivo inválido.");
+            return false;
+        }
+        if (string.IsNullOrEmpty(bootImgPath) || !File.Exists(bootImgPath))
+        {
+            OutputReceived?.Invoke("ERROR: La imagen a arrancar no existe.");
+            return false;
+        }
+
+        var target = ResolveFastbootTarget(serial);
+        var result = ExecuteFastboot($"-s {target} boot \"{bootImgPath}\"", timeoutMs: 90000);
         return result.Success;
     }
 
@@ -944,6 +958,14 @@ namespace PCAndroidRooter.Services;
         KillAdb();
         Task.Delay(500).Wait();
         ExecuteAdb("start-server", dispatchOutput: false, timeoutMs: 5000);
+    }
+
+    public void RebootToDownload(string serial)
+    {
+        OutputReceived?.Invoke("Enviando el teléfono a Download Mode (Samsung)...");
+        var result = ExecuteAdb($"-s {serial} reboot download", timeoutMs: 8000);
+        if (!result.Success)
+            OutputReceived?.Invoke("  ADB ya no responde (esperado: el teléfono está entrando en Download Mode).");
     }
 
     public void RebootToBootloader(string serial)

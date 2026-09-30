@@ -23,7 +23,9 @@ public enum RootMethodStatus
     Success,
     Failed,
     NotSupported,
-    WaitingDevice
+    WaitingDevice,
+    /// <summary>Parche listo y, si se pudo, probado. Aún no se ha grabado.</summary>
+    ReadyToCommit
 }
 
 public partial class RootMethod : ObservableObject
@@ -60,6 +62,7 @@ public partial class RootMethod : ObservableObject
         RootMethodStatus.Failed => new SolidColorBrush(Color.FromRgb(0xEF, 0x53, 0x50)),
         RootMethodStatus.NotSupported => new SolidColorBrush(Color.FromRgb(0xFF, 0xA7, 0x26)),
         RootMethodStatus.WaitingDevice => new SolidColorBrush(Color.FromRgb(0xFF, 0xA7, 0x26)),
+        RootMethodStatus.ReadyToCommit => new SolidColorBrush(Color.FromRgb(0xFF, 0xA7, 0x26)),
         _ => new SolidColorBrush(Color.FromRgb(0xBB, 0xBB, 0xBB))
     };
 
@@ -71,6 +74,7 @@ public partial class RootMethod : ObservableObject
         RootMethodStatus.Failed => "Falló",
         RootMethodStatus.NotSupported => "No soportado",
         RootMethodStatus.WaitingDevice => "Esperando dispositivo...",
+        RootMethodStatus.ReadyToCommit => "Listo para grabar",
         _ => "Desconocido"
     };
 

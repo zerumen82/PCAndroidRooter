@@ -147,34 +147,22 @@ public partial class MainViewModel : ObservableObject
             Name = "One-Click Root",
             Description = "Intenta automáticamente todos los métodos",
             FriendlyName = " Root Automático",
-            FriendlyDescription = "Solo si el bootloader ya está desbloqueado. No borra fotos ni apps. Si está bloqueado, no hace nada.",
+            FriendlyDescription = "Si el bootloader está cerrado, lo desbloquea (borra el teléfono) y luego instala Magisk. Si ya está abierto, solo instala Magisk.",
             Type = RootMethodType.OneClickRoot,
             Icon = "\uE73A",
             Difficulty = "Media",
-            RiskLevel = "Medio"
+            RiskLevel = "Alto"
         });
         RootMethods.Add(new RootMethod
         {
             Name = "Magisk Patch",
             Description = "Parchea boot.img con Magisk (recomendado)",
             FriendlyName = "Root con Magisk",
-            FriendlyDescription = "No borra tus datos. Parchea el arranque y guarda una copia del boot original. Requiere bootloader ya desbloqueado.",
+            FriendlyDescription = "Igual que el automático: desbloquea si está cerrado (eso borra) y luego graba Magisk.",
             Type = RootMethodType.MagiskPatch,
             Icon = "\uE730",
             Difficulty = "Media",
-            RiskLevel = "Medio"
-        });
-        RootMethods.Add(new RootMethod
-        {
-            Name = "KernelSU",
-            Description = "Alternativa ligera a Magisk",
-            FriendlyName = "KernelSU (no disponible)",
-            FriendlyDescription = "No está implementado. Antes ejecutaba Magisk con otro nombre.",
-            Type = RootMethodType.KernelSU,
-            Icon = "\uE730",
-            Difficulty = "—",
-            RiskLevel = "—",
-            Status = RootMethodStatus.NotSupported
+            RiskLevel = "Alto"
         });
         RootMethods.Add(new RootMethod
         {
@@ -186,46 +174,7 @@ public partial class MainViewModel : ObservableObject
             Icon = "\uE785",
             Difficulty = "Media",
             RiskLevel = "Alto",
-            IsAdvanced = false
-        });
-        RootMethods.Add(new RootMethod
-        {
-            Name = "ADB Exploit",
-            Description = "Explota vulnerabilidades vía ADB",
-            FriendlyName = "Root por ADB (no disponible)",
-            FriendlyDescription = "No está implementado. No se intenta y no modifica el teléfono.",
-            Type = RootMethodType.AdbExploit,
-            Icon = "\uE74C",
-            Difficulty = "—",
-            RiskLevel = "—",
-            IsAdvanced = true,
-            Status = RootMethodStatus.NotSupported
-        });
-        RootMethods.Add(new RootMethod
-        {
-            Name = "TWRP Recovery",
-            Description = "Instala recovery personalizado + Magisk",
-            FriendlyName = "Recovery (no disponible)",
-            FriendlyDescription = "No instala ningún recovery. Antes solo reiniciaba el teléfono.",
-            Type = RootMethodType.CustomRecovery,
-            Icon = "\uE74C",
-            Difficulty = "—",
-            RiskLevel = "—",
-            IsAdvanced = true,
-            Status = RootMethodStatus.NotSupported
-        });
-        RootMethods.Add(new RootMethod
-        {
-            Name = "Root Temporal",
-            Description = "No disponible en esta versión",
-            FriendlyName = "Root Temporal (no disponible)",
-            FriendlyDescription = "No implementado en esta versión. Usa Desbloquear Bootloader + Magisk Patch.",
-            Type = RootMethodType.TemporaryRoot,
-            Icon = "\uE7BA",
-            Difficulty = "Fácil",
-            RiskLevel = "Bajo",
-            IsAdvanced = true,
-            Status = RootMethodStatus.NotSupported
+            IsAdvanced = true
         });
         RootMethods.Add(new RootMethod
         {
@@ -406,39 +355,42 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
-        // El root no desbloquea. Si la UI ve el bootloader cerrado, ni siquiera empieza.
+        // Cerrado o no confirmado: el root desbloquea, y eso formatea. Un solo aviso.
         bool isOneClick = method.Type == RootMethodType.OneClickRoot;
-        if ((isOneClick || method.Type == RootMethodType.MagiskPatch || method.Type == RootMethodType.FastbootBoot)
-            && !BootloaderUnlocked)
+        var includesUnlock = isOneClick || method.Type == RootMethodType.MagiskPatch;
+        if (includesUnlock && !BootloaderUnlocked)
         {
-            MessageBox.Show(
-                "El bootloader está BLOQUEADO (o no se ha podido confirmar).\n\n" +
-                "Rootear este teléfono exigiría desbloquearlo, y eso BORRA todos los datos.\n\n" +
-                "No se ha hecho nada. El teléfono sigue igual.",
-                "No se toca el teléfono",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
-            AppendLog("Root cancelado: bootloader bloqueado. No se ha borrado nada.");
-            return;
-        }
-
-        if (isOneClick)
-        {
-            var proceed = MessageBox.Show(
-                "El bootloader figura como desbloqueado.\n\n" +
-                "Se parcheará la partición boot con Magisk. Esto NO borra fotos, apps ni cuentas.\n" +
-                "Si el parche falla, el teléfono podría no encender hasta restaurar el boot original (se guarda una copia).\n\n" +
+            var wipe = MessageBox.Show(
+                "El bootloader no figura como desbloqueado.\n\n" +
+                "Si está cerrado, el root lo desbloquea y ESO BORRA fotos, apps y cuentas. " +
+                "El backup no las recupera. En el teléfono hay que confirmar con Volumen+.\n\n" +
+                "Si no se puede leer el estado, no se desbloquea.\n\n" +
                 "¿Continuar?",
-                "Root sin borrar datos",
+                "El root incluye desbloquear",
                 MessageBoxButton.OKCancel,
                 MessageBoxImage.Warning);
-            if (proceed != MessageBoxResult.OK)
+            if (wipe != MessageBoxResult.OK)
             {
-                AppendLog("Operación cancelada por el usuario.");
+                AppendLog("Cancelado. No se ha desbloqueado ni flasheado.");
                 return;
             }
         }
-        else
+        else if (method.Type == RootMethodType.FastbootBoot && !BootloaderUnlocked)
+        {
+            MessageBox.Show(
+                "El arranque temporal necesita el bootloader ya desbloqueado.\n\n" +
+                "No se ha hecho nada. Usa Root automático si aceptas el borrado del desbloqueo.",
+                "No se toca el teléfono",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            AppendLog("Arranque temporal cancelado: bootloader no desbloqueado.");
+            return;
+        }
+
+        var isRootFlow = isOneClick
+            || method.Type == RootMethodType.MagiskPatch
+            || method.Type == RootMethodType.FastbootBoot;
+        if (!isRootFlow)
         {
             var warning = GetRootWarning(method);
             if (!string.IsNullOrEmpty(warning))
@@ -460,9 +412,6 @@ public partial class MainViewModel : ObservableObject
         IsRooting = true;
         _rootCts = new CancellationTokenSource();
         _detectionService.Pause();
-        var keepPausedSamsungUnlock =
-            method.Type == RootMethodType.BootloaderUnlock &&
-            DeviceManufacturer.Equals("samsung", StringComparison.OrdinalIgnoreCase);
 
         try
         {
@@ -470,21 +419,12 @@ public partial class MainViewModel : ObservableObject
             var status = await Task.Run(
                 () => _rootService.ExecuteMethodAsync(method, SelectedSerial, _rootCts.Token),
                 _rootCts.Token);
+            status = await ResolveReadyToCommitAsync(status, SelectedSerial, _rootCts.Token);
             AppendLog($"Método '{method.Name}' finalizado con estado: {status}");
         }
         finally
         {
-            if (keepPausedSamsungUnlock)
-            {
-                _detectionService.Pause();
-                _detectionPausedForSamsungUnlock = true;
-                AppendLog("Detección de dispositivos pausada — sigue las instrucciones para el desbloqueo manual en Download Mode.");
-                AppendLog("Cuando termines, pulsa 'Refresh' para reconectar el dispositivo.");
-            }
-            else
-            {
-                _detectionService.Resume();
-            }
+            _detectionService.Resume();
             IsRooting = false;
             _rootCts?.Dispose();
             _rootCts = null;
@@ -504,29 +444,21 @@ public partial class MainViewModel : ObservableObject
 
         if (!BootloaderUnlocked)
         {
-            MessageBox.Show(
-                "El bootloader está BLOQUEADO (o no se ha podido confirmar).\n\n" +
-                "Rootear exigiría desbloquearlo, y eso BORRA todos los datos.\n\n" +
-                "No se ha hecho nada. El teléfono sigue igual.",
-                "No se toca el teléfono",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
-            AppendLog("Root automático cancelado: bootloader bloqueado. No se ha borrado nada.");
-            return;
-        }
-
-        var proceed = MessageBox.Show(
-            "El bootloader figura como desbloqueado.\n\n" +
-            "Se parcheará la partición boot con Magisk. Esto NO borra fotos, apps ni cuentas.\n" +
-            "Si el parche falla, el teléfono podría no encender hasta restaurar el boot original (se guarda una copia).\n\n" +
-            "¿Continuar?",
-            "Root sin borrar datos",
-            MessageBoxButton.OKCancel,
-            MessageBoxImage.Warning);
-        if (proceed != MessageBoxResult.OK)
-        {
-            AppendLog("Operación cancelada por el usuario.");
-            return;
+            var wipe = MessageBox.Show(
+                "El bootloader no figura como desbloqueado.\n\n" +
+                "Si está cerrado, primero se desbloquea y ESO BORRA fotos, apps y cuentas. " +
+                "El backup no las recupera. Después se instala Magisk solo.\n\n" +
+                "En el teléfono confirma con Volumen+ si lo pide. " +
+                "Si no se puede leer el estado, no se desbloquea.\n\n" +
+                "¿Continuar?",
+                "El root incluye desbloquear",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (wipe != MessageBoxResult.OK)
+            {
+                AppendLog("Cancelado. No se ha desbloqueado ni flasheado.");
+                return;
+            }
         }
 
         // Find the OneClickRoot method
@@ -551,6 +483,7 @@ public partial class MainViewModel : ObservableObject
             var status = await Task.Run(
                 () => _rootService.ExecuteMethodAsync(oneClickMethod, SelectedSerial, _rootCts.Token),
                 _rootCts.Token);
+            status = await ResolveReadyToCommitAsync(status, SelectedSerial, _rootCts.Token);
 
             if (status == RootMethodStatus.Success)
             {
@@ -571,6 +504,62 @@ public partial class MainViewModel : ObservableObject
                 AppendLog("El root automático no pudo completarse.");
                 AppendLog("Revisa la consola para más detalles.");
             }
+        }
+        finally
+        {
+            _detectionService.Resume();
+            IsRooting = false;
+            _rootCts?.Dispose();
+            _rootCts = null;
+        }
+    }
+
+    private async Task<RootMethodStatus> ResolveReadyToCommitAsync(RootMethodStatus status, string serial, CancellationToken token)
+    {
+        if (status != RootMethodStatus.ReadyToCommit)
+            return status;
+
+        AppendLog("El parche está listo. Se graba solo, sin otra pregunta.");
+        return await Task.Run(() => _rootService.CommitPatchedBootAsync(serial, token), token);
+    }
+
+    [RelayCommand]
+    private async Task RestoreOriginalBoot()
+    {
+        if (string.IsNullOrEmpty(SelectedSerial))
+        {
+            AppendLog("[ERROR] No hay dispositivo seleccionado.");
+            return;
+        }
+        if (IsRooting) return;
+        if (!BootloaderUnlocked)
+        {
+            MessageBox.Show(
+                "El bootloader no está confirmado como desbloqueado.\n\nNo se restaura nada.",
+                "Restaurar boot",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        var answer = MessageBox.Show(
+            "Se volverá a grabar la copia del arranque original (boot o init_boot).\n\n" +
+            "No borra fotos ni apps. Sirve para quitar el root o recuperar un parche malo.\n\n" +
+            "¿Continuar?",
+            "Restaurar boot original",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Warning);
+        if (answer != MessageBoxResult.OK) return;
+
+        IsRooting = true;
+        _rootCts = new CancellationTokenSource();
+        _detectionService.Pause();
+        try
+        {
+            var serial = SelectedSerial;
+            var token = _rootCts.Token;
+            var status = await Task.Run(() => _rootService.RestoreOriginalBootAsync(serial, token), token);
+            AppendLog($"Restauración del boot: {status}");
         }
         finally
         {

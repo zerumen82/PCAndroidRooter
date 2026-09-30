@@ -65,4 +65,102 @@ public class RootSafetyPolicyTests
         // convertir un bootloader cerrado en "desbloqueado".
         Assert.Equal(expected, RootSafetyPolicy.InterpretBootloaderState(vbmeta, flash, verified, other));
     }
+
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    [InlineData(null, false)]
+    public void MayBeginRoot_OnlyWhenConfirmedUnlocked(bool? unlocked, bool expected)
+    {
+        Assert.Equal(expected, RootSafetyPolicy.MayBeginRoot(unlocked));
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(null, false)]
+    public void MayUnlockDuringRoot_OnlyWhenConfirmedLocked(bool? unlocked, bool expected)
+    {
+        Assert.Equal(expected, RootSafetyPolicy.MayUnlockDuringRoot(unlocked));
+    }
+
+    [Fact]
+    public void MayFlashPermanent_RequiresEvidenceConfirmAndEitherTempRootOrInitBoot()
+    {
+        Assert.False(RootSafetyPolicy.MayFlashPermanent(null, true, true, true, true, false));
+        Assert.False(RootSafetyPolicy.MayFlashPermanent(false, true, true, true, true, false));
+        Assert.False(RootSafetyPolicy.MayFlashPermanent(true, false, true, true, true, false));
+        Assert.False(RootSafetyPolicy.MayFlashPermanent(true, true, false, true, true, false));
+        Assert.False(RootSafetyPolicy.MayFlashPermanent(true, true, true, false, true, false));
+        Assert.False(RootSafetyPolicy.MayFlashPermanent(true, true, true, true, false, false));
+        Assert.True(RootSafetyPolicy.MayFlashPermanent(true, true, true, true, true, false));
+        Assert.True(RootSafetyPolicy.MayFlashPermanent(true, true, true, true, false, true));
+        Assert.True(RootSafetyPolicy.MayFlashPermanent(true, true, true, true, false, false, cannotTempBoot: true));
+        Assert.False(RootSafetyPolicy.MayFlashPermanent(false, true, true, true, false, false, cannotTempBoot: true));
+    }
+
+    [Theory]
+    [InlineData("1", true)]
+    [InlineData("0", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void SamsungOemUnlockSwitch_IsNotTheBootloader(string? prop, bool expected)
+    {
+        Assert.Equal(expected, RootSafetyPolicy.SamsungOemUnlockSwitchOn(prop));
+    }
+
+    [Theory]
+    [InlineData("boot_a", "BOOT")]
+    [InlineData("init_boot_b", "INIT_BOOT")]
+    [InlineData("/dev/block/by-name/boot", "BOOT")]
+    [InlineData("userdata", null)]
+    public void HeimdallPitName_OnlyBootOrInitBoot(string partition, string? expected)
+    {
+        Assert.Equal(expected, RootSafetyPolicy.HeimdallPitName(partition));
+    }
+
+    [Theory]
+    [InlineData(true, true, null, true)]
+    [InlineData(true, true, true, true)]
+    [InlineData(true, true, false, false)]
+    [InlineData(false, true, null, false)]
+    [InlineData(null, true, null, false)]
+    [InlineData(true, false, null, false)]
+    public void MayRestoreOriginal_BlocksKnownFingerprintMismatch(bool? unlocked, bool originalValid, bool? fingerprint, bool expected)
+    {
+        Assert.Equal(expected, RootSafetyPolicy.MayRestoreOriginal(unlocked, originalValid, fingerprint));
+    }
+
+    [Fact]
+    public void ChooseBootPartition_PrefersInitBootOnActiveSlot()
+    {
+        var names = new HashSet<string> { "boot_a", "boot_b", "init_boot_a", "init_boot_b" };
+        Assert.Equal("init_boot_a", RootSafetyPolicy.ChooseBootPartition(names, "_a"));
+        Assert.Equal("init_boot_b", RootSafetyPolicy.ChooseBootPartition(names, "_b"));
+        Assert.Equal("init_boot", RootSafetyPolicy.ChooseBootPartition(
+            new HashSet<string> { "boot", "init_boot" }, null));
+        Assert.Equal("boot_b", RootSafetyPolicy.ChooseBootPartition(
+            new HashSet<string> { "init_boot_a", "boot_b" }, "_b"));
+        Assert.Null(RootSafetyPolicy.ChooseBootPartition(new HashSet<string> { "userdata", "vendor_boot_a" }, "_a"));
+    }
+
+    [Theory]
+    [InlineData("init_boot_a", true)]
+    [InlineData("/dev/block/by-name/boot_b", true)]
+    [InlineData("userdata", false)]
+    [InlineData("vbmeta_a", false)]
+    [InlineData("", false)]
+    public void IsFlashableBootPartition_RejectsAnythingElse(string name, bool expected)
+    {
+        Assert.Equal(expected, RootSafetyPolicy.IsFlashableBootPartition(name));
+    }
+
+    [Theory]
+    [InlineData("uid=0(root) gid=0(root)", true)]
+    [InlineData("package:com.topjohnwu.magisk", false)]
+    [InlineData("", false)]
+    public void OutputShowsRootUid_IgnoresMagiskPackageName(string output, bool expected)
+    {
+        Assert.Equal(expected, RootSafetyPolicy.OutputShowsRootUid(output));
+    }
 }

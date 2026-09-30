@@ -188,7 +188,7 @@ case RootMethodType.CustomRecovery:
     private async Task<RootMethodStatus> MagiskRootAsync(string serial, CancellationToken ct)
     {
         Log("╔═══════════════════════════════════════════╗");
-        Log("║   ROOT VÍA MAGISK (no borra tus datos)   ║");
+        Log("║   ROOT VÍA MAGISK                        ║");
         Log("╚═══════════════════════════════════════════╝");
 
         // ════════════════════════════════════════════════════
@@ -226,6 +226,10 @@ case RootMethodType.CustomRecovery:
         }
         ct.ThrowIfCancellationRequested();
 
+        var unlockGate = await EnsureBootloaderForRootAsync(serial, ct);
+        if (unlockGate != null)
+            return unlockGate.Value;
+
         // ════════════════════════════════════════════════════
         // PASO 2: Detectar partición boot (con soporte A/B)
         // ════════════════════════════════════════════════════
@@ -233,11 +237,11 @@ case RootMethodType.CustomRecovery:
         var bootPart = await _adbService.FindBootPartitionAsync(serial, ct);
         if (bootPart == null)
         {
-            LogError("No se encontró la partición boot.");
+            LogError("No se encontró init_boot ni boot.");
             Log("  Posibles causas:");
-            Log("  • Bootloader bloqueado (usa 'Desbloquear Bootloader' primero)");
-            Log("  • Dispositivo con particiones no estándar");
-            Log("  • Permisos insuficientes");
+            Log("  • La partición no es legible sin root. Hace falta el archivo oficial de esta misma versión.");
+            Log("  • Particiones con otro nombre.");
+            Log("  No se desbloquea el bootloader desde aquí: eso borraría los datos.");
             return RootMethodStatus.Failed;
         }
         LogOk($"Partición boot: {bootPart.Path} ({bootPart.Size / 1024 / 1024} MB)");
@@ -271,6 +275,19 @@ case RootMethodType.CustomRecovery:
                 }
             }
         }
+
+        bootPart.FastbootPartition = RootSafetyPolicy.FastbootNameFromBlockPath(
+            string.IsNullOrEmpty(bootPart.FastbootPartition) ? bootPart.Path : bootPart.FastbootPartition);
+        if (bootPart.Path.Contains(bootPart.FastbootPartition, StringComparison.Ordinal) == false)
+            bootPart.FastbootPartition = RootSafetyPolicy.FastbootNameFromBlockPath(bootPart.Path);
+        if (!RootSafetyPolicy.IsFlashableBootPartition(bootPart.FastbootPartition))
+        {
+            LogError($"Partición no permitida ({bootPart.FastbootPartition}). Solo boot o init_boot.");
+            Log("  No se ha reiniciado el teléfono.");
+            return RootMethodStatus.Failed;
+        }
+        LogOk($"Partición fastboot: {bootPart.FastbootPartition}" +
+              (RootSafetyPolicy.IsInitBootPartition(bootPart.FastbootPartition) ? " (init_boot, Android 13+)" : ""));
         ct.ThrowIfCancellationRequested();
 
         // ════════════════════════════════════════════════════
@@ -365,8 +382,14 @@ case RootMethodType.CustomRecovery:
         }
         catch (Exception ex)
         {
-            LogWarning($"  No se pudo guardar backup: {ex.Message}");
-            Log("  ⚠ Sin backup, no se podrá restaurar si algo falla.");
+            LogError($"No se pudo guardar la copia original: {ex.Message}");
+            Log("  Sin esa copia no hay marcha atrás. No se parchea ni se flashea.");
+            return RootMethodStatus.Failed;
+        }
+        if (!File.Exists(bootImgBackup))
+        {
+            LogError("La copia original no quedó en disco. No se continúa.");
+            return RootMethodStatus.Failed;
         }
         ct.ThrowIfCancellationRequested();
 
@@ -638,240 +661,95 @@ case RootMethodType.CustomRecovery:
         ct.ThrowIfCancellationRequested();
 
         // ════════════════════════════════════════════════════
-        // PASO 10: No reiniciar ni flashear si el bootloader no está confirmado.
-        // Desbloquearlo para poder flashear borraría todos los datos.
+        // PASO 10: Probar sin grabar. El flash permanente es otro paso,
+        // solo si el usuario lo confirma y la copia original es válida.
         // ════════════════════════════════════════════════════
         var blBeforeFlash = _adbService.CheckBootloaderUnlock(serial);
-        if (AdbService.ParseBootloaderUnlocked(blBeforeFlash.Output) != true)
+        if (!RootSafetyPolicy.MayBeginRoot(AdbService.ParseBootloaderUnlocked(blBeforeFlash.Output)))
         {
             LogError("Bootloader bloqueado o no confirmado. NO se reinicia ni se flashea.");
             Log("  Con el bootloader cerrado no se puede rootear, y desbloquearlo BORRA los datos.");
             Log("  El teléfono sigue en Android. No se ha borrado nada.");
-            Log($"  Boot original (por si lo necesitas): {bootImgBackup}");
+            Log($"  Boot original: {bootImgBackup}");
             Log($"  Boot parcheado, NO flasheado: {patchedImgLocal}");
             _adbService.RestartAdb();
             return RootMethodStatus.Failed;
         }
 
-        // ════════════════════════════════════════════════════
-        // PASO 10b: Verificar Samsung (no flashea automático)
-        // ════════════════════════════════════════════════════
-        var manufacturer = deviceInfo.Manufacturer.ToLowerInvariant();
-        if (manufacturer == "samsung")
+        var isSamsung = deviceInfo.Manufacturer.Contains("samsung", StringComparison.OrdinalIgnoreCase);
+        var partition = bootPart.FastbootPartition;
+        var isInitBoot = RootSafetyPolicy.IsInitBootPartition(partition);
+        var originalOk = BootImageValidator.ValidateOriginal(bootImgBackup).Status == BootImageValidator.ValidationStatus.Valid;
+        if (!originalOk || !RootSafetyPolicy.IsFlashableBootPartition(partition))
         {
-            Log("\n⚠ Samsung detectado — flasheo manual requerido.");
-            Log("\n═══════════════════════════════════════════");
-            Log("  BOOT PATCH COMPLETADO (Samsung)");
-            Log("═══════════════════════════════════════════");
-            Log($"  Boot.img parcheado: {patchedImgLocal}");
-            Log($"  Boot.img original: {bootImgBackup}");
-            Log("");
-            Log("  Para flashear en Samsung necesitas ODIN:");
-            Log("  1. Verifica que el bootloader esté DESBLOQUEADO");
-            Log("  2. Descarga ODIN: https://odindownload.com");
-            Log("  3. Apaga el teléfono");
-            Log("  4. Entra en Download Mode: VOL- + VOL+ + conectar USB");
-            Log("  5. En ODIN: haz clic en 'AP' → selecciona el parcheado");
-            Log("  6. Haz clic en 'Start'");
-            Log("");
-            Log("  Después del reinicio, busca la app Magisk.");
-            _adbService.RestartAdb();
-            // El root NO está hecho aún: requiere flasheo manual con ODIN
-            return RootMethodStatus.WaitingDevice;
-        }
-
-        // ════════════════════════════════════════════════════
-        // PASO 10: Reiniciar a fastboot (solo no-Samsung)
-        // ════════════════════════════════════════════════════
-        Log("\nPASO 10: Reiniciando a modo fastboot...");
-        _adbService.RebootToBootloader(serial);
-
-        var fastbootReady = _adbService.WaitForFastbootDevice(serial, 45, ct);
-        if (!fastbootReady)
-        {
-            LogError("El dispositivo no entró en modo fastboot.");
-            Log("  Opciones:");
-            Log("  1. Intenta manualmente: adb reboot bootloader");
-            Log("  2. El bootloader puede estar bloqueado");
-            Log($"  Boot.img parcheado guardado: {patchedImgLocal}");
-            Log($"  Boot.img original (backup): {bootImgBackup}");
-            Log($"  Flash manual: fastboot flash boot \"{patchedImgLocal}\"");
-            _adbService.RestartAdb();
+            LogError("Falta una copia original válida o la partición no es boot/init_boot. No se reinicia.");
             return RootMethodStatus.Failed;
         }
-        LogOk("Dispositivo en modo fastboot.");
-        ct.ThrowIfCancellationRequested();
 
-        // ════════════════════════════════════════════════════
-        // PASO 11: Flashear boot.img parcheado
-        // ════════════════════════════════════════════════════
-        Log("\nPASO 11: Flasheando boot.img parcheado...");
-        Log($"  Archivo: {patchedImgLocal}");
-        Log($"  Tamaño: {patchedValidation.FileSize / 1024 / 1024} MB");
-
-        // ════════════════════════════════════════════════════
-        // VALIDACIÓN FINAL: Magic bytes ANTES de flashear
-        // ════════════════════════════════════════════════════
-        try
+        var fingerprint = _adbService.ExecuteAdb($"-s {serial} shell getprop ro.build.fingerprint", ct: ct, timeoutMs: 8000);
+        var session = new BootSession
         {
-            using var fs = File.OpenRead(patchedImgLocal);
-            var magic = new byte[8];
-            int read = fs.Read(magic, 0, 8);
-            if (read < 8 || !magic.SequenceEqual(new byte[] { 0x41, 0x4E, 0x44, 0x52, 0x4F, 0x49, 0x44, 0x21 }))
+            Serial = serial,
+            OriginalPath = bootImgBackup,
+            PatchedPath = patchedImgLocal,
+            FastbootPartition = partition,
+            Fingerprint = fingerprint.Success ? fingerprint.Output.Trim() : null,
+            IsInitBoot = isInitBoot,
+            PatchEvidence = patchedValidation.ContainsMagisk || injectionVerified,
+            TempBootVerified = false,
+            UseDownloadMode = isSamsung
+        };
+
+        if (isSamsung)
+        {
+            Log("\nPASO 10: Samsung no tiene fastboot. Se graba por Download Mode (Odin/heimdall).");
+            Log("  No se prueba en RAM. No se formatea otra vez: el bootloader ya está abierto.");
+        }
+        else if (!isInitBoot)
+        {
+            Log("\nPASO 10: Prueba temporal (fastboot boot). No graba la partición.");
+            _adbService.RebootToBootloader(serial);
+            if (!_adbService.WaitForFastbootDevice(serial, 45, ct))
             {
-                LogError("VALIDACIÓN FINAL FALLIDA: boot.img parcheado NO tiene magic bytes Android válido.");
-                LogError("El archivo está corrupto. No se flasheará.");
-                CleanupDeviceTempFiles(serial);
+                LogError("No entró en fastboot. No se ha flasheado nada.");
+                _adbService.RestartAdb();
+                return RootMethodStatus.Failed;
+            }
+            ct.ThrowIfCancellationRequested();
+
+            if (!_adbService.BootImageViaFastboot(serial, patchedImgLocal))
+            {
+                LogError("fastboot boot rechazó la imagen. NO se flashea.");
+                Log("  Reiniciando al sistema que ya estaba instalado.");
                 _adbService.FastbootReboot(serial);
                 _adbService.RestartAdb();
                 return RootMethodStatus.Failed;
             }
-            LogOk("  Magic bytes: ANDROID! ✓ (verificación final)");
-        }
-        catch (Exception ex)
-        {
-            LogError($"No se pudo verificar magic bytes: {ex.Message}");
-            LogError("No se flashearán archivos sin verificar.");
-            CleanupDeviceTempFiles(serial);
-            _adbService.FastbootReboot(serial);
+
+            Log("  Imagen aceptada en RAM. Esperando Android para comprobar uid=0...");
             _adbService.RestartAdb();
-            return RootMethodStatus.Failed;
-        }
-
-        var flashResult = _adbService.FlashBootViaFastboot(serial, patchedImgLocal);
-        if (!flashResult)
-        {
-            LogError("No se pudo flashear boot.img.");
-            Log("  Causas posibles:");
-            Log("  • Bootloader sigue bloqueado");
-            Log("  • Fastboot no reconoce el dispositivo");
-            Log("");
-            Log("  ╔═══════════════════════════════════════════╗");
-            Log("  ║  IMPORTANTE: Tienes el backup del original ║");
-            Log("  ╚═══════════════════════════════════════════╝");
-            Log($"  Para restaurar si el dispositivo no arranca:");
-            Log($"    fastboot flash boot \"{bootImgBackup}\"");
-            Log($"    fastboot reboot");
-            Log($"  Para flashear el parcheado manualmente:");
-            Log($"    fastboot flash boot \"{patchedImgLocal}\"");
-            _adbService.FastbootReboot(serial);
-            _adbService.RestartAdb();
-            return RootMethodStatus.Failed;
-        }
-        LogOk("boot.img flasheado correctamente.");
-
-        // ════════════════════════════════════════════════════
-        // PASO 12: Reiniciar y verificar
-        // ════════════════════════════════════════════════════
-        Log("\nPASO 12: Reiniciando dispositivo...");
-        _adbService.FastbootReboot(serial);
-        _adbService.RestartAdb();
-        Log("  Esperando a que el dispositivo arranque...");
-
-        // Esperar a que el dispositivo esté listo
-        var bootTimeout = 120; // 2 minutos máximo
-        bool deviceReady = false;
-        for (int i = 0; i < bootTimeout; i++)
-        {
-            if (ct.WaitHandle.WaitOne(1000) || ct.IsCancellationRequested)
-                break;
-
-            if (i % 15 == 0 && i > 0)
-                Log($"    Esperando arranque... ({i}s / {bootTimeout}s)");
-
-            var devices = _adbService.GetConnectedDevices();
-            if (devices.Contains(serial))
+            session.TempBootVerified = await WaitForRealRootAsync(serial, ct, 90);
+            if (!session.TempBootVerified)
             {
-                var bootCheck = _adbService.ExecuteAdb(
-                    $"-s {serial} shell getprop sys.boot_completed", ct: ct, timeoutMs: 5000);
-                if (bootCheck.Success && bootCheck.Output.Trim() == "1")
-                {
-                    deviceReady = true;
-                    break;
-                }
+                LogError("La prueba no dio root real (uid=0). NO se graba la partición.");
+                Log("  Un reinicio vuelve al sistema de siempre. Los datos no se han borrado.");
+                RebootBackToInstalledSystem(serial);
+                return RootMethodStatus.Failed;
             }
+            LogOk("Root temporal verificado. Se graba ahora, sin otra pregunta.");
+        }
+        else
+        {
+            Log("\nPASO 10: Este teléfono usa init_boot.");
+            Log("  No se puede probar con fastboot boot. Se graba solo esa partición.");
+            Log("  No formatea el teléfono. Si no arranca, Restaurar boot vuelve al original.");
         }
 
-        if (!deviceReady)
-        {
-            LogWarning("El dispositivo no respondió en 2 minutos.");
-            Log("  Puede estar arrancando más lento de lo normal.");
-            Log("  Espera unos minutos más y verifica manualmente.");
-            Log("");
-            Log($"  Si el dispositivo NO arranca, restaura el original:");
-            Log($"    1. Entra en fastboot: adb reboot bootloader");
-            Log($"    2. Ejecuta: fastboot flash boot \"{bootImgBackup}\"");
-            Log($"    3. Reinicia: fastboot reboot");
-            return RootMethodStatus.Failed;
-        }
-
-        LogOk("Dispositivo arrancado correctamente.");
-
-        // ════════════════════════════════════════════════════
-        // PASO 13: Verificar root REAL
-        // ════════════════════════════════════════════════════
-        Log("\nPASO 13: Verificando root real...");
-        await Task.Delay(5000, ct); // Dar tiempo a que Magisk inicialice
-
-        var rootVerified = BootImageValidator.VerifyRoot(serial, (cmd, dispatch, timeout) =>
-        {
-            var r = _adbService.ExecuteAdb(cmd, dispatch, ct: ct, timeoutMs: timeout);
-            return (r.Success, r.Output, r.Error);
-        });
-
-        if (rootVerified)
-        {
-            Log("");
-            Log("╔═══════════════════════════════════════════╗");
-            Log("║     ✅ ROOT COMPLETADO Y VERIFICADO       ║");
-            Log("╚═══════════════════════════════════════════╝");
-            Log("");
-            LogOk("El dispositivo tiene root REAL y funcional.");
-            Log("");
-            Log("  Próximos pasos:");
-            Log("  1. Busca la app 'Magisk' en el cajón de aplicaciones");
-            Log("  2. Ábrela para completar la configuración inicial");
-            Log("  3. Si Magisk no aparece, descárgala desde:");
-            Log("     https://github.com/topjohnwu/Magisk/releases");
-            Log("");
-            Log("  Archivos de seguridad:");
-            Log($"    Boot original: {bootImgBackup}");
-            Log($"    Boot parcheado: {patchedImgLocal}");
-            Log("  Guarda ambos archivos en un lugar seguro.");
-            Log("");
-            Log("  ⚠ Para restaurar el boot original (quitar root):");
-            Log($"    1. adb reboot bootloader");
-            Log($"    2. fastboot flash boot \"{bootImgBackup}\"");
-            Log($"    3. fastboot reboot");
-
-            // Limpiar archivos temporales del dispositivo
-            _adbService.Shell(serial, "rm -rf /data/local/tmp/magisk /data/local/tmp/boot_to_patch.img /data/local/tmp/ramdisk.cpio /data/local/tmp/new-boot.img");
-            _adbService.RestartAdb();
-
-            return RootMethodStatus.Success;
-        }
-
-        // Root no verificado — posible fallo
-        Log("");
-        LogWarning("═══════════════════════════════════════════");
-        LogWarning("  ROOT INSTALADO PERO NO VERIFICADO");
-        LogWarning("═══════════════════════════════════════════");
-        Log("");
-        Log("  El dispositivo arrancó correctamente, pero no se detectó root.");
-        Log("  Esto puede deberse a:");
-        Log("  • Magisk necesita configuración inicial (abre la app Magisk)");
-        Log("  • SELinux está en modo enforcing y bloquea su");
-        Log("  • El parche no se aplicó correctamente");
-        Log("");
-        Log("  Acciones recomendadas:");
-        Log("  1. Abre la app Magisk y completa la instalación");
-        Log("  2. Reinicia el dispositivo");
-        Log("  3. Vuelve a ejecutar la verificación");
-        Log("");
-        Log($"  Boot original (backup): {bootImgBackup}");
-        Log($"  Boot parcheado: {patchedImgLocal}");
-
-        return RootMethodStatus.Failed;
+        SaveBootSession(session);
+        Log($"  Original: {bootImgBackup}");
+        Log($"  Parche: {patchedImgLocal}");
+        Log($"  Partición: {partition}");
+        return await CommitPatchedBootAsync(serial, ct);
     }
 private async Task<RootMethodStatus> AdbExploitRootAsync(string serial, CancellationToken ct)
     {
@@ -1017,6 +895,212 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
     /// procesos largos (wipe/flash) para no apagarse a mitad del proceso.
     /// Antes un "Desconocido" saltaba el check (fail-open).
     /// </summary>
+    private async Task<RootMethodStatus> SamsungUnlockViaDownloadModeAsync(string serial, CancellationToken ct, string backupDir)
+    {
+        var allowed = _adbService.ExecuteAdb($"-s {serial} shell getprop sys.oem_unlock_allowed", ct: ct, timeoutMs: 8000);
+        if (!RootSafetyPolicy.SamsungOemUnlockSwitchOn(allowed.Success ? allowed.Output : null))
+        {
+            LogError("Samsung: activa 'Desbloqueo OEM' en Opciones de desarrollador y pulsa Root otra vez.");
+            Log("  Sin ese interruptor el teléfono no deja desbloquear. No se ha reiniciado.");
+            Log("  El interruptor no significa que ya esté desbloqueado.");
+            var other = _adbService.ExecuteAdb($"-s {serial} shell getprop ro.boot.other.locked", ct: ct, timeoutMs: 8000);
+            if (other.Success && other.Output.Trim() == "1")
+                LogWarning("One UI reciente puede haber ocultado el interruptor. En ese caso este modelo no deja desbloquear por el método oficial.");
+            Log($"  Backup parcial, por si lo quieres: {backupDir}");
+            return RootMethodStatus.Failed;
+        }
+
+        Log("Mandando el Samsung a Download Mode...");
+        Log("  EN EL TELÉFONO: mantén Volumen ARRIBA para confirmar el desbloqueo.");
+        LogWarning("Eso borra el teléfono y desactiva Knox para siempre (Samsung Pay, Secure Folder).");
+        _adbService.RebootToDownload(serial);
+
+        Log("Esperando a que Android vuelva por USB (hasta 10 minutos)...");
+        var back = await WaitForDeviceReadyAsync(serial, ct, maxWaitSeconds: 600);
+        ct.ThrowIfCancellationRequested();
+        if (!back)
+        {
+            LogError("El Samsung no volvió por ADB. Si ya confirmaste con Volumen Arriba, el borrado ya ocurrió.");
+            Log("  1. Termina el asistente de Android");
+            Log("  2. Activa Depuración USB y acepta la clave del PC");
+            Log("  3. Pulsa Root otra vez: esa vez ya no formatea, instala Magisk por Download Mode.");
+            return RootMethodStatus.Failed;
+        }
+
+        var parsed = AdbService.ParseBootloaderUnlocked(_adbService.CheckBootloaderUnlock(serial).Output);
+        if (!RootSafetyPolicy.MayBeginRoot(parsed))
+        {
+            LogError("El teléfono volvió, pero el bootloader sigue cerrado. ¿Pulsaste Volumen Arriba en la pantalla de aviso?");
+            return RootMethodStatus.Failed;
+        }
+
+        LogOk("Samsung desbloqueado. Sigue la instalación de Magisk.");
+        return RootMethodStatus.Success;
+    }
+
+    private async Task<RootMethodStatus> FlashSamsungDownloadAsync(string serial, BootSession session, CancellationToken ct)
+    {
+        var pit = RootSafetyPolicy.HeimdallPitName(session.FastbootPartition);
+        var heimdall = FindHeimdall();
+        if (pit == null || heimdall == null)
+        {
+            LogError(heimdall == null
+                ? "Falta heimdall.exe, que es quien habla el protocolo Odin."
+                : "La partición no es boot ni init_boot. No se flashea.");
+            Log("  Copia heimdall.exe en la carpeta tools junto a este programa y pulsa Root otra vez.");
+            Log("  No se ha reiniciado a Download Mode. El bootloader, si ya estaba abierto, sigue igual.");
+            Log($"  Parche listo: {session.PatchedPath}");
+            Log($"  Original: {session.OriginalPath}");
+            return RootMethodStatus.Failed;
+        }
+
+        Log($"Grabando {pit} por Download Mode. No se toca userdata.");
+        _adbService.RebootToDownload(serial);
+        Log("  Si aparece una pantalla de aviso, pulsa Volumen Arriba para entrar (ya no desbloquea: solo permite flashear).");
+
+        var seen = false;
+        for (var i = 0; i < 90 && !ct.IsCancellationRequested; i++)
+        {
+            await Task.Delay(1000, ct);
+            if (i % 15 == 0 && i > 0)
+                Log($"    Esperando Download Mode... ({i}s)");
+            if (RunHeimdall(heimdall, "detect", 8000, ct).ExitCode == 0)
+            {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen)
+        {
+            LogError("No apareció el Samsung en Download Mode. No se ha flasheado.");
+            _adbService.RestartAdb();
+            return RootMethodStatus.Failed;
+        }
+
+        var flash = RunHeimdall(heimdall, $"flash --{pit} \"{session.PatchedPath}\" --no-reboot", 180000, ct);
+        if (flash.ExitCode != 0)
+        {
+            LogError("heimdall no pudo grabar. No se reintenta en otra partición.");
+            Log(flash.Output);
+            _adbService.RestartAdb();
+            return RootMethodStatus.Failed;
+        }
+
+        LogOk($"{pit} grabado. Reiniciando el Samsung...");
+        RunHeimdall(heimdall, "reboot", 20000, ct);
+        _adbService.RestartAdb();
+        var verified = await WaitForRealRootAsync(serial, ct, 120);
+        if (!verified)
+        {
+            LogError("Se grabó, pero no hay uid=0. Usa Restaurar boot si no arranca.");
+            return RootMethodStatus.Failed;
+        }
+
+        LogOk("Samsung con root verificado. Los datos de esta sesión no se han vuelto a borrar.");
+        return RootMethodStatus.Success;
+    }
+
+    private static string? FindHeimdall()
+    {
+        var beside = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tools", "heimdall.exe");
+        if (File.Exists(beside)) return beside;
+        var path = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrEmpty(path)) return null;
+        foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = Path.Combine(dir.Trim(), "heimdall.exe");
+            if (File.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
+
+    private (int ExitCode, string Output) RunHeimdall(string exe, string arguments, int timeoutMs, CancellationToken ct)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null) return (-1, "no se pudo arrancar heimdall");
+            var stdout = proc.StandardOutput.ReadToEndAsync(ct);
+            var stderr = proc.StandardError.ReadToEndAsync(ct);
+            if (!proc.WaitForExit(timeoutMs))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch { }
+                return (-1, "heimdall tardó demasiado");
+            }
+            var output = stdout.GetAwaiter().GetResult() + stderr.GetAwaiter().GetResult();
+            ct.ThrowIfCancellationRequested();
+            if (!string.IsNullOrWhiteSpace(output))
+                Log(output.Trim());
+            return (proc.ExitCode, output);
+        }
+        catch (Exception ex)
+        {
+            return (-1, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// null = seguir con el parche. Un estado = parar.
+    /// </summary>
+    private async Task<RootMethodStatus?> EnsureBootloaderForRootAsync(string serial, CancellationToken ct)
+    {
+        var parsed = AdbService.ParseBootloaderUnlocked(_adbService.CheckBootloaderUnlock(serial).Output);
+        if (RootSafetyPolicy.MayBeginRoot(parsed))
+        {
+            LogOk("Bootloader ya desbloqueado. No se formatea.");
+            return null;
+        }
+
+        if (!RootSafetyPolicy.MayUnlockDuringRoot(parsed))
+        {
+            LogError("No se puede confirmar que el bootloader esté cerrado.");
+            Log("  No se desbloquea a ciegas y no se flashea. El teléfono no se ha modificado.");
+            return RootMethodStatus.Failed;
+        }
+
+        LogWarning("Bootloader CERRADO. El root lo desbloquea ahora.");
+        LogWarning("Esto BORRA fotos, apps y cuentas. El backup no las recupera.");
+        Log("  Si el teléfono lo pide, confirma con Volumen+.");
+        ct.ThrowIfCancellationRequested();
+
+        var unlock = await UnlockBootloaderAsync(serial, ct);
+        if (unlock == RootMethodStatus.WaitingDevice)
+            return RootMethodStatus.WaitingDevice;
+        if (unlock != RootMethodStatus.Success)
+            return RootMethodStatus.Failed;
+
+        Log("Esperando a que el teléfono vuelva después del formateo...");
+        var back = await WaitForDeviceReadyAsync(serial, ct);
+        ct.ThrowIfCancellationRequested();
+        if (!back)
+        {
+            LogError("El teléfono no volvió por ADB. El desbloqueo ya borró los datos.");
+            Log("  1. Termina el asistente de Android");
+            Log("  2. Activa Depuración USB y acepta la clave RSA");
+            Log("  3. Pulsa otra vez Root. Esa segunda vez ya no formatea: solo instala Magisk.");
+            return RootMethodStatus.Failed;
+        }
+
+        var again = AdbService.ParseBootloaderUnlocked(_adbService.CheckBootloaderUnlock(serial).Output);
+        if (!RootSafetyPolicy.MayBeginRoot(again))
+        {
+            LogError("Después del desbloqueo el bootloader no figura como abierto. No se flashea.");
+            return RootMethodStatus.Failed;
+        }
+
+        LogOk("Bootloader abierto y el teléfono responde. Sigue el parche.");
+        return null;
+    }
+
     private async Task<bool> EnsureMinBatteryAsync(string serial, DeviceInfo? deviceInfo = null)
     {
         deviceInfo ??= await _adbService.GetDeviceInfoAsync(serial);
@@ -1054,8 +1138,8 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
 
         if (manufacturer == "samsung")
         {
-            Log("\n⚠ IMPORTANTE: Samsung NO usa fastboot.");
-            Log("  El desbloqueo debe hacerse manualmente desde Download Mode.");
+            Log("\nSamsung sí se puede rootear. No usa fastboot: el desbloqueo es Download Mode.");
+            Log("  Tras el backup el teléfono se reinicia solo a esa pantalla.");
 
             var samsungOemCheck = _adbService.ExecuteAdb($"-s {serial} shell getprop ro.boot.other.locked");
             var isMediatek = await _adbService.DetectIsMediaTekAsync(serial);
@@ -1155,51 +1239,7 @@ Log("  ❌ 'su' no funcionó. Necesitas desbloquear bootloader e intentar Magisk
         }
 
         if (manufacturer == "samsung")
-        {
-            Log("\n=== FASE 3: Desbloqueo MANUAL del bootloader ===");
-            Log("\n⚠ Samsung NO compatible con desbloqueo automático via fastboot.");
-            Log("  Debes seguir estos pasos MANUALMENTE:");
-
-                var samsungOemCheck2 = _adbService.ExecuteAdb($"-s {serial} shell getprop ro.boot.other.locked");
-                var isMediatek2 = await _adbService.DetectIsMediaTekAsync(serial);
-
-            if (samsungOemCheck2.Success && samsungOemCheck2.Output.Trim() == "1")
-            {
-                LogWarning("One UI 8 ha deshabilitado el toggle 'Desbloqueo OEM'.");
-                Log("  Si no ves la opción en Ajustes > Opciones de desarrollador:");
-                if (isMediatek2)
-                {
-                    LogOk("Tu dispositivo usa chip MediaTek → compatible con MTKClient.");
-                    LogOk("Usa el método 'MTKClient Unlock' en lugar de este.");
-                    Log("  Cierra este método y selecciona 'MTKClient Unlock' en la lista.");
-                }
-                else
-                {
-                    Log("  Revisa en XDA si hay un método alternativo para tu modelo.");
-                }
-                Log("");
-            }
-
-            Log("");
-            Log("  1. En el teléfono: Ajustes > Opciones de desarrollador");
-            Log("     -> Activar 'Desbloqueo OEM'");
-            Log("  2. Apaga el teléfono completamente");
-            Log("  3. Conecta el USB al PC");
-            Log("  4. Pulsa VOL- + VOL+ y SIN SOLTAR, conecta el USB al teléfono");
-            Log("     (esto entra en DOWNLOAD MODE - pantalla amarilla con advertencia)");
-            Log("  5. Pulsa VOL+ largo para confirmar el desbloqueo");
-            Log("  6. El teléfono se resetea solo (BORRA TODOS LOS DATOS)");
-            Log("");
-            Log("  ⚠ Knox se dispara permanentemente -> Samsung Pay/Secure Folder");
-            Log("    y otros servicios Samsung dejarán de funcionar.");
-            Log("");
-            Log("  Una vez desbloqueado, configura el teléfono de nuevo,");
-            Log("  activa Depuración USB, y usa 'Magisk Patch' para rootear.");
-            Log("  El backup está disponible en: " + backupDir);
-
-            _adbService.RestartAdb();
-            return RootMethodStatus.WaitingDevice;
-        }
+            return await SamsungUnlockViaDownloadModeAsync(serial, ct, backupDir);
 
         Log("\n=== FASE 3: Desbloqueo del bootloader ===");
         Log("\nReiniciando a modo bootloader/fastboot...");
@@ -1952,50 +1992,31 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
 
         // ── FASE 2: Verificar si ya tiene root ──
         Log("\n▸ FASE 2: Verificando root actual...");
-        var rooted = DetectIfRooted(serial);
-        if (rooted)
+        var suNow = _adbService.ExecuteAdb($"-s {serial} shell su -c id", ct: ct, timeoutMs: 8000);
+        if (suNow.Success && RootSafetyPolicy.OutputShowsRootUid(suNow.Output))
         {
             LogOk("═══════════════════════════════════════════");
-            LogOk("  EL DISPOSITIVO YA TIENE ROOT");
+            LogOk("  EL DISPOSITIVO YA TIENE ROOT (uid=0)");
             LogOk("═══════════════════════════════════════════");
-            Log("  No es necesario ejecutar ningún método.");
-            Log("  Magisk o su ya están instalados y funcionales.");
+            Log("  No se toca el arranque.");
             return RootMethodStatus.Success;
         }
         Log("  Dispositivo sin root. Procediendo...");
         ct.ThrowIfCancellationRequested();
 
-        // ── FASE 3: Bootloader. Desbloquearlo BORRA el teléfono: no es parte del root. ──
-        Log("\n▸ FASE 3: Verificando estado del bootloader...");
-        var blCheck = _adbService.CheckBootloaderUnlock(serial);
-        var bootloaderUnlocked = AdbService.ParseBootloaderUnlocked(blCheck.Output) == true;
-
-        if (!bootloaderUnlocked)
-        {
-            LogError("Bootloader BLOQUEADO o estado desconocido.");
-            LogError("No se puede rootear sin desbloquearlo, y desbloquearlo BORRA todos los datos.");
-            Log("  El root automático no desbloquea el bootloader.");
-            Log("  No se ha reiniciado el teléfono. Tus datos siguen intactos.");
-            Log("");
-            Log("  Si aceptas perder fotos, apps y cuentas, es otro botón, aparte:");
-            Log("  'Desbloquear Bootloader' en métodos avanzados.");
-            Log("  No lo pulses si quieres conservar los datos.");
-            return RootMethodStatus.Failed;
-        }
-
-        LogOk("Bootloader: DESBLOQUEADO");
-        Log("  Se parchea la partición boot. Eso no formatea tus datos.");
+        // ── FASE 3: Magisk. Si el bootloader está cerrado, Magisk lo desbloquea antes. ──
+        Log("\n▸ FASE 3: Bootloader y Magisk...");
+        Log("  Cerrado confirmado: backup, desbloqueo (borra el teléfono) y después el parche.");
+        Log("  Ya abierto: solo el parche, sin formatear.");
+        Log("  Estado desconocido: no se hace nada.");
         ct.ThrowIfCancellationRequested();
 
-        // ── FASE 4: Root via Magisk Patch (sin métodos experimentales detrás) ──
         Log("");
-        Log("▸ FASE 4: Aplicando root via Magisk Patch...");
-        Log("  Este proceso:");
-        Log("  1. Extrae el boot.img del dispositivo");
-        Log("  2. Lo parchea con Magisk");
-        Log("  3. Lo flashea de vuelta (solo con bootloader ya desbloqueado)");
-        Log("  4. Reinicia el dispositivo");
-        Log("  No se borran fotos, apps ni cuentas.");
+        Log("▸ Aplicando root via Magisk...");
+        Log("  1. Desbloquea el bootloader si está cerrado");
+        Log("  2. Extrae init_boot o boot y lo parchea");
+        Log("  3. Si es boot, lo prueba en RAM y solo graba si hay uid=0");
+        Log("  4. Si es init_boot, graba esa partición");
         Log("");
 
         var magiskResult = await MagiskRootAsync(serial, ct);
@@ -2019,8 +2040,8 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         Log("  Los datos de usuario no se han borrado.");
         Log($"  Dispositivo: {deviceInfo.Manufacturer} {model}");
         Log($"  Android: {androidVersion}");
-        return magiskResult == RootMethodStatus.WaitingDevice
-            ? RootMethodStatus.WaitingDevice
+        return magiskResult is RootMethodStatus.WaitingDevice or RootMethodStatus.NotSupported
+            ? magiskResult
             : RootMethodStatus.Failed;
     }
 
@@ -2331,6 +2352,13 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
             return RootMethodStatus.Failed;
         }
         Log($"Partición boot encontrada: {bootPart.Path} ({bootPart.Size / 1024 / 1024} MB)");
+        if (RootSafetyPolicy.IsInitBootPartition(bootPart.FastbootPartition.Length > 0 ? bootPart.FastbootPartition : bootPart.Path))
+        {
+            LogError("Este teléfono usa init_boot. fastboot boot no puede probarlo y no se va a grabar desde aquí.");
+            Log("  Usa 'Root con Magisk': pedirá confirmación antes de grabar solo init_boot.");
+            Log("  No se ha reiniciado el teléfono.");
+            return RootMethodStatus.Failed;
+        }
 
         ct.ThrowIfCancellationRequested();
 
@@ -2552,9 +2580,203 @@ private async Task<RootMethodStatus> OneClickRootAsync(string serial, Cancellati
         Log("  • El boot.img parcheado es incompatible con el kernel");
         Log("  • El bootloader está bloqueado (fastboot boot requiere bootloader desbloqueado)");
         Log("  • La partición boot no es booteable directamente");
-        Log("\n  Prueba a desbloquear bootloader y luego usar 'Magisk Patch'.");
+        Log("\n  No se ha grabado nada. No hace falta desbloquear el bootloader otra vez.");
         return RootMethodStatus.Failed;
     }
+
+    public bool PendingIsInitBoot { get; private set; }
+
+    public async Task<RootMethodStatus> CommitPatchedBootAsync(string serial, CancellationToken ct)
+    {
+        var session = LoadBootSession(serial);
+        if (session == null)
+        {
+            LogError("No hay un parche pendiente de grabar.");
+            return RootMethodStatus.Failed;
+        }
+
+        var unlocked = AdbService.ParseBootloaderUnlocked(_adbService.CheckBootloaderUnlock(serial).Output);
+        var originalValid = File.Exists(session.OriginalPath)
+            && BootImageValidator.ValidateOriginal(session.OriginalPath).Status == BootImageValidator.ValidationStatus.Valid;
+        var patchedOk = File.Exists(session.PatchedPath)
+            && BootImageValidator.ValidatePatched(session.PatchedPath, session.OriginalPath).Status == BootImageValidator.ValidationStatus.Valid;
+
+        if (!RootSafetyPolicy.MayFlashPermanent(
+                unlocked, originalValid && patchedOk, session.PatchEvidence, userConfirmed: true,
+                session.TempBootVerified, session.IsInitBoot, session.UseDownloadMode)
+            || !RootSafetyPolicy.IsFlashableBootPartition(session.FastbootPartition))
+        {
+            LogError("No se cumplen las condiciones para grabar. No se flashea.");
+            Log("  Hace falta bootloader confirmado, copia original, parche válido y tu confirmación.");
+            return RootMethodStatus.Failed;
+        }
+
+        if (!await EnsureMinBatteryAsync(serial))
+            return RootMethodStatus.Failed;
+        ct.ThrowIfCancellationRequested();
+
+        if (session.UseDownloadMode)
+            return await FlashSamsungDownloadAsync(serial, session, ct);
+
+        Log($"Grabando solo {session.FastbootPartition}. No se toca userdata.");
+        _adbService.RebootToBootloader(serial);
+        if (!_adbService.WaitForFastbootDevice(serial, 45, ct))
+        {
+            LogError("No entró en fastboot. No se ha flasheado.");
+            _adbService.RestartAdb();
+            return RootMethodStatus.Failed;
+        }
+
+        var flashed = _adbService.FlashBootViaFastboot(serial, session.PatchedPath, session.FastbootPartition);
+        if (!flashed)
+        {
+            LogError("El flash falló. No se reintenta.");
+            Log($"  Copia original: {session.OriginalPath}");
+            Log("  Usa 'Restaurar boot original' si el teléfono no arranca.");
+            _adbService.FastbootReboot(serial);
+            _adbService.RestartAdb();
+            return RootMethodStatus.Failed;
+        }
+
+        LogOk($"{session.FastbootPartition} grabado. Reiniciando...");
+        _adbService.FastbootReboot(serial);
+        _adbService.RestartAdb();
+        var verified = await WaitForRealRootAsync(serial, ct, 120);
+        if (!verified)
+        {
+            LogError("La partición se grabó, pero no se verificó uid=0.");
+            Log($"  Restaura el original ({session.OriginalPath}) con el botón de la ventana.");
+            return RootMethodStatus.Failed;
+        }
+
+        LogOk("Root grabado y verificado. Los datos de usuario no se han borrado.");
+        Log($"  Para volver atrás: Restaurar boot original ({session.OriginalPath}).");
+        _adbService.Shell(serial, "rm -rf /data/local/tmp/magisk /data/local/tmp/boot_to_patch.img /data/local/tmp/ramdisk.cpio /data/local/tmp/new-boot.img");
+        return RootMethodStatus.Success;
+    }
+
+    public Task<RootMethodStatus> DiscardPendingBootAsync(string serial, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        Log("No se graba nada. Reiniciando al sistema que ya estaba instalado.");
+        RebootBackToInstalledSystem(serial);
+        var session = LoadBootSession(serial);
+        if (session != null)
+        {
+            session.TempBootVerified = false;
+            SaveBootSession(session);
+        }
+        return Task.FromResult(RootMethodStatus.Failed);
+    }
+
+    public async Task<RootMethodStatus> RestoreOriginalBootAsync(string serial, CancellationToken ct)
+    {
+        var session = LoadBootSession(serial);
+        if (session == null || string.IsNullOrEmpty(session.OriginalPath))
+        {
+            LogError("No hay una copia del boot original para este teléfono.");
+            return RootMethodStatus.Failed;
+        }
+
+        var unlocked = AdbService.ParseBootloaderUnlocked(_adbService.CheckBootloaderUnlock(serial).Output);
+        var originalValid = File.Exists(session.OriginalPath)
+            && BootImageValidator.ValidateOriginal(session.OriginalPath).Status == BootImageValidator.ValidationStatus.Valid;
+        bool? fingerprintMatches = null;
+        if (!string.IsNullOrEmpty(session.Fingerprint) && _adbService.GetConnectedDevices().Contains(serial))
+        {
+            var current = _adbService.ExecuteAdb($"-s {serial} shell getprop ro.build.fingerprint", ct: ct, timeoutMs: 8000);
+            if (current.Success && !string.IsNullOrWhiteSpace(current.Output))
+                fingerprintMatches = string.Equals(current.Output.Trim(), session.Fingerprint, StringComparison.Ordinal);
+        }
+
+        if (!RootSafetyPolicy.MayRestoreOriginal(unlocked, originalValid, fingerprintMatches)
+            || !RootSafetyPolicy.IsFlashableBootPartition(session.FastbootPartition))
+        {
+            LogError("No se restaura: bootloader no confirmado, copia inválida, partición no permitida o la versión del sistema cambió.");
+            Log("  Restaurar un boot de otra versión puede dejar el teléfono sin arrancar.");
+            return RootMethodStatus.Failed;
+        }
+
+        if (!await EnsureMinBatteryAsync(serial))
+            return RootMethodStatus.Failed;
+
+        Log($"Restaurando {session.FastbootPartition} desde {session.OriginalPath}");
+        _adbService.RebootToBootloader(serial);
+        if (!_adbService.WaitForFastbootDevice(serial, 45, ct))
+        {
+            LogError("No entró en fastboot. No se ha flasheado.");
+            _adbService.RestartAdb();
+            return RootMethodStatus.Failed;
+        }
+
+        var ok = _adbService.FlashBootViaFastboot(serial, session.OriginalPath, session.FastbootPartition);
+        _adbService.FastbootReboot(serial);
+        _adbService.RestartAdb();
+        if (!ok)
+        {
+            LogError("No se pudo restaurar el original.");
+            return RootMethodStatus.Failed;
+        }
+
+        LogOk("Boot original restaurado. No se ha tocado userdata.");
+        return RootMethodStatus.Success;
+    }
+
+    private async Task<bool> WaitForRealRootAsync(string serial, CancellationToken ct, int maxSeconds)
+    {
+        for (var i = 0; i < maxSeconds && !ct.IsCancellationRequested; i++)
+        {
+            await Task.Delay(1000, ct);
+            if (i % 15 == 0 && i > 0)
+                Log($"    Esperando arranque... ({i}s / {maxSeconds}s)");
+            if (!_adbService.GetConnectedDevices().Contains(serial))
+                continue;
+            var boot = _adbService.ExecuteAdb($"-s {serial} shell getprop sys.boot_completed", ct: ct, timeoutMs: 5000);
+            if (!boot.Success || boot.Output.Trim() != "1")
+                continue;
+            await Task.Delay(3000, ct);
+            var su = _adbService.ExecuteAdb($"-s {serial} shell su -c id", ct: ct, timeoutMs: 8000);
+            if (su.Success && RootSafetyPolicy.OutputShowsRootUid(su.Output))
+                return true;
+        }
+        return false;
+    }
+
+    private void RebootBackToInstalledSystem(string serial)
+    {
+        try
+        {
+            if (_adbService.GetConnectedDevices().Contains(serial))
+                _adbService.RebootDevice(serial);
+            else
+                _adbService.FastbootReboot(serial);
+        }
+        catch (Exception ex)
+        {
+            LogWarning($"No se pudo reiniciar solo: {ex.Message}. Mantén encendido 10 segundos.");
+        }
+        _adbService.RestartAdb();
+    }
+
+    private void SaveBootSession(BootSession session)
+    {
+        PendingIsInitBoot = session.IsInitBoot;
+        var path = BootSessionPath(session.Serial);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(session,
+            new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static BootSession? LoadBootSession(string serial)
+    {
+        var path = BootSessionPath(serial);
+        if (!File.Exists(path)) return null;
+        return System.Text.Json.JsonSerializer.Deserialize<BootSession>(File.ReadAllText(path));
+    }
+
+    private static string BootSessionPath(string serial) =>
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "boot_sessions",
+            AdbService.SanitizeSerialForPath(serial) + ".json");
 
     private bool DetectIfRooted(string serial)
     {
